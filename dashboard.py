@@ -1,8 +1,3 @@
-# dashboard_test6.py
-# ----------------------------------------------------------
-# Real-time Dashboard (Home, Feeder A, Feeder B, Feeder C)
-# Smooth Live Updates (no blinking/full page rerun)
-# ----------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -716,4 +711,5 @@ elif nav == "Feeder C":
         if not st.session_state.running:
             status_ph.info("Simulation paused for Feeder C. Press ▶ Start to resume or ↺ Reset.")
         else:
+
             status_ph.info("Stopped streaming Feeder C (tab changed or error).")
