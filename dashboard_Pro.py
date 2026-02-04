@@ -1,8 +1,3 @@
-# smart_grid_cyberpunk_v26_1.py
-# ----------------------------------------------------------
-# FINAL PROFESSIONAL VERSION (PLATINUM RELEASE v26.1)
-# UPDATE: Added J(x) Residual Cost Function Plot for SE Monitoring
-# ----------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -1745,4 +1740,5 @@ elif nav == "Feeder Analytics":
 
 elif nav == "AI Forecasting":
     st.header("🔮 HYBRID AI PREDICTION (PROPHET vs LSTM)")
+
     render_ai_dashboard()
