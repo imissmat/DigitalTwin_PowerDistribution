@@ -1,4 +1,5 @@
 
+
 import streamlit as st
 import pandas as pd
 import datetime
@@ -1057,7 +1058,7 @@ if not st.session_state.logged_in:
         st.markdown("<br><br><br>", unsafe_allow_html=True)
         st.markdown("""
         <div class="login-box">
-            <div class="login-title">AZU DIGITAL WIN</div>
+            <div class="login-title">AZU DIGITAL TWIN</div>
             <div class="login-sub">Final Year Project - II</div>
         </div>
         """, unsafe_allow_html=True)
@@ -1072,16 +1073,16 @@ if not st.session_state.logged_in:
                     st.session_state.run_simulation = True
                     log_event("Session Start", "Security", "Admin Uplink Established")
                     st.rerun()
-                else: st.error("⛔ ACCESS DENIED: INVALID CREDENTIALS")
+                else: st.error("ACCESS DENIED: INVALID CREDENTIALS")
     st.stop()
 
 # ----------------------------------------------------------
 # 7. SIDEBAR
 # ----------------------------------------------------------
 with st.sidebar:
-    c1, c2 = st.columns([1, 4])
-    with c1: st.write("⚡")
-    with c2: st.markdown("### GRID OS\n*SCADA V26.1*")
+    c1, c2 = st.columns([1, 25])
+    with c1: st.write("")
+    with c2: st.markdown("### AZU Digital Twin\n*Final Year Project - II*")
     
     curr_v = 0.0 if st.session_state.relay_trip else ((0.85 * st.session_state.tap_position) if st.session_state.fault_active else (0.99 * st.session_state.tap_position))
     curr_state, state_col, state_desc = get_operating_state(curr_v, 1.0, st.session_state.fault_active, st.session_state.relay_trip)
@@ -1104,7 +1105,7 @@ with st.sidebar:
         speed = st.select_slider("CLOCK SPEED", options=[0.5, 1.0, 2.0, 5.0], value=st.session_state.speed)
         st.session_state.speed = speed
         
-        if st.button("🔄 SYSTEM REBOOT", use_container_width=True):
+        if st.button("RESTART", use_container_width=True):
             st.session_state.idx = 0
             st.session_state.relay_trip = False
             st.session_state.fault_active = False
@@ -1125,31 +1126,31 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption("THREAT INJECTION")
-    safety_lock = st.toggle("🔓 SAFETY OVERRIDE", value=False)
+    safety_lock = st.toggle("SAFETY OVERRIDE", value=False)
     
     with st.container(border=True):
         f_bus = st.selectbox("TARGET BUS", bus_list, index=0)
         f_type = st.selectbox("FAULT VECTOR", list(FAULT_LIBRARY.keys()))
         
         if st.session_state.recloser_state == "LOCKOUT":
-            st.error("❌ LOCKOUT - MANUAL RESET REQ")
-            if st.button("✅ RESET RECLOSER", type="secondary", use_container_width=True):
+            st.error("LOCKOUT - MANUAL RESET REQ")
+            if st.button("RESET RECLOSER", type="secondary", use_container_width=True):
                 st.session_state.relay_trip = False
                 st.session_state.fault_active = False
                 st.session_state.recloser_state = "CLOSED"
                 log_event("Protection", "Reset", "Manual Recloser Reset")
                 st.rerun()
         elif st.session_state.fault_active:
-            st.warning("⚠️ FAULT IN PROGRESS")
+            st.warning("FAULT IN PROGRESS")
             st.caption(f"Recloser: {st.session_state.recloser_state}")
-            if st.button("✅ FORCE CLEAR", type="primary", use_container_width=True):
+            if st.button("FORCE CLEAR", type="primary", use_container_width=True):
                 st.session_state.fault_active = False
                 st.session_state.relay_trip = False
                 st.session_state.recloser_state = "CLOSED"
                 log_event("Restoration", "Manual", "Fault Cleared by Operator")
                 st.rerun()
         else:
-            if st.button("🔥 EXECUTE FAULT", type="primary", use_container_width=True, disabled=not safety_lock):
+            if st.button("EXECUTE FAULT", type="primary", use_container_width=True, disabled=not safety_lock):
                 st.session_state.fault_active = True
                 st.session_state.fault_bus = f_bus
                 st.session_state.fault_type = f_type
@@ -1157,13 +1158,13 @@ with st.sidebar:
                 st.rerun()
 
     st.markdown("---")
-    with st.expander("📝 EVENT LOGS", expanded=False):
+    with st.expander("EVENT LOGS", expanded=False):
         st.dataframe(st.session_state.audit_log, hide_index=True, use_container_width=True)
         csv = st.session_state.audit_log.to_csv(index=False).encode('utf-8')
-        st.download_button("💾 EXPORT DATA", data=csv, file_name="log.csv", mime="text/csv", use_container_width=True)
+        st.download_button("EXPORT DATA", data=csv, file_name="log.csv", mime="text/csv", use_container_width=True)
 
     st.markdown("---")
-    if st.button("🔒 TERMINATE SESSION", use_container_width=True):
+    if st.button("LOGOUT", use_container_width=True):
         st.session_state.logged_in = False
         st.rerun()
 
@@ -1251,24 +1252,8 @@ def render_home():
 
     st.markdown(f"#### 📡 LIVE TELEMETRY (STATUS: {sys_state})")
     
-    # --- SOLAR MIX INDICATOR ---
-    with st.expander("☀️ SOLAR DISPATCH & GENERATION MIX", expanded=True):
-        sm1, sm2, sm3, sm4 = st.columns(4)
-        status_txt = "NIGHT MODE (GRID 100%)"
-        if 6 <= sim_hour < 10: status_txt = "🌅 RAMP UP (MIXED)"
-        elif 10 <= sim_hour < 15: status_txt = "☀️ PEAK SUN (SOLAR MASTER)"
-        elif 15 <= sim_hour < 19: status_txt = "🌇 RAMP DOWN (MIXED)"
-        
-        with sm1: st.metric("TIME OF DAY", f"{sim_hour:02d}:00", delta=status_txt, delta_color="off")
-        with sm2: st.metric("SOLAR GENERATION", f"{p_solar:.1f} kW", delta=f"{solar_pct*100:.1f}% MIX")
-        with sm3: st.metric("GRID SUPPLY", f"{p_grid:.1f} kW", delta=f"{(1-solar_pct)*100:.1f}% MIX", delta_color="inverse")
-        with sm4: st.metric("SEASON FACTOR", f"{season_factor*100:.0f}%", delta="Efficiency")
-        
-        mix_df = pd.DataFrame({"Source": ["Solar", "Grid"], "Power (kW)": [p_solar, p_grid]})
-        fig_mix = go.Figure(go.Bar(x=mix_df["Power (kW)"], y=mix_df["Source"], orientation='h', marker_color=['#ffee00', '#00f3ff']))
-        fig_mix.update_layout(height=100, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"}, xaxis=dict(showgrid=False), yaxis=dict(showgrid=False))
-        st.plotly_chart(fig_mix, use_container_width=True)
-
+    # --- REMOVED: SOLAR DISPATCH & GENERATION MIX UI ---
+    
     max_p = max(3000, p_total * 1.5) 
     max_q = max(2000, q_val * 1.5)
 
@@ -1740,5 +1725,4 @@ elif nav == "Feeder Analytics":
 
 elif nav == "AI Forecasting":
     st.header("🔮 HYBRID AI PREDICTION (PROPHET vs LSTM)")
-
     render_ai_dashboard()
