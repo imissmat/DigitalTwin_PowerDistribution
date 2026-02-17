@@ -7,6 +7,7 @@ import numpy as np
 import cmath
 import os
 import joblib
+import random
 
 # AI / ML Imports
 from sklearn.metrics import mean_squared_error, mean_absolute_error
@@ -32,7 +33,7 @@ except ImportError:
 # 1. CONFIGURATION & CYBERPUNK STYLING
 # ----------------------------------------------------------
 st.set_page_config(
-    page_title="NEON GRID CONTROL v30.0 (Physics Upgrade)", 
+    page_title="NEON GRID CONTROL v30.6 (Fixed Topology)", 
     layout="wide", 
     page_icon="☀️",
     initial_sidebar_state="expanded"
@@ -119,13 +120,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# 2. PHYSICS CONSTANTS & CONFIG
+# 2. PHYSICS CONSTANTS & CONFIG (WEAK GRID MODE)
 # ----------------------------------------------------------
 # CSV FILES CONFIG
-CSV_PATH = "Historical_Data\Total_P&Q.csv"
-FEEDER_A_P = "Historical_Data\FeederA_P.csv"
-FEEDER_A_Q = "Historical_Data\FeederA_Q.csv"
-SOLAR_DATA_FILE = "Historical_Data\Solardata.csv"
+CSV_PATH = "Historical_Data/Total_P&Q.csv"
+FEEDER_A_P = "Historical_Data/FeederA_P.csv"
+FEEDER_A_Q = "Historical_Data/FeederA_Q.csv"
+SOLAR_DATA_FILE = "Historical_Data/Solardata.csv"
 
 # AI MODEL PATHS
 PROPHET_MODEL_FILE = "prophet_model.json"
@@ -142,8 +143,10 @@ WAVE_TIME = np.linspace(0, 0.02, 100)
 NOMINAL_FREQ = 50.0
 TRANSFORMER_RATING_KVA = 10000.0 
 TRANSFORMER_TAU = 20.0  
-SOURCE_IMPEDANCE = 0.01 + 0.1j  
-LINE_IMPEDANCE_PER_UNIT_DIST = 0.005 + 0.002j 
+SOURCE_IMPEDANCE = 0.05 + 0.1j  
+
+# *** WEAK GRID PHYSICS: High Impedance to allow Voltage Instability ***
+LINE_IMPEDANCE_PER_UNIT_DIST = 0.045 + 0.045j 
 
 # SWING EQUATION CONSTANTS
 INERTIA_H = 5.0 
@@ -156,13 +159,6 @@ FAULT_LIBRARY = {
     "L-L (Line-to-Line)":     {"Zf": 0.01, "type": "LL", "color": "#ff5500", "icon": "🔥"},
     "L-L-G (2-Line-Ground)":  {"Zf": 0.0, "type": "LLG", "color": "#ff0000", "icon": "💥"},
     "L-L-L (3-Phase Bolted)": {"Zf": 0.0, "type": "LLL", "color": "#ff0055", "icon": "☠️"}
-}
-
-# --- SOLAR PV CONFIGURATION ---
-SOLAR_BUS_CONFIG = {
-    "bus1005": 100.0, "bus1010": 150.0, "bus2008": 80.0, "bus2015": 120.0,
-    "bus2025": 200.0, "bus3006": 50.0, "bus3020": 100.0, "bus3035": 150.0,
-    "bus3050": 90.0, "bus3100": 75.0
 }
 
 # --- BESS (BATTERY) CONFIGURATION ---
@@ -474,25 +470,23 @@ EDGE_LIST_RAW = [
     ("bus3077", "bus3078"), ("bus3076", "bus3079"), ("bus3079", "bus3080"), ("bus3080", "bus3081"),
     ("bus3080", "bus3082"), ("bus3082", "bus3083"), ("bus3083", "bus3084"), ("bus3084", "bus3085"),
     ("bus3085", "bus3086"), ("bus3086", "bus3087"), ("bus3087", "bus3088"), ("bus3088", "bus3089"),
-    ("bus3089", "bus3090"), ("bus3090", "bus3091"), ("bus3082", "bus3092"), ("bus3092", "bus3093"),
-    ("bus3093", "bus3094"), ("bus3094", "bus3095"), ("bus3095", "bus3096"), ("bus3096", "bus3097"),
-    ("bus3092", "bus3098"), ("bus3098", "bus3099"), ("bus3092", "bus3100"), ("bus3100", "bus3101"),
-    ("bus3101", "bus3102"), ("bus3102", "bus3103"), ("bus3100", "bus3104"), ("bus3104", "bus3105"),
-    ("bus3105", "bus3106"), ("bus3082", "bus3107"), ("bus3107", "bus3108"), ("bus3108", "bus3109"),
-    ("bus3109", "bus3110"), ("bus3110", "bus3111"), ("bus3111", "bus3112"), ("bus3107", "bus3113"),
-    ("bus3113", "bus3114"), ("bus3114", "bus3115"), ("bus3113", "bus3116"), ("bus3116", "bus3117"),
-    ("bus3107", "bus3118"), ("bus3118", "bus3119"), ("bus3119", "bus3120"), ("bus3120", "bus3121"),
-    ("bus3121", "bus3122"), ("bus3119", "bus3123"), ("bus3123", "bus3124"), ("bus3124", "bus3125"),
-    ("bus3125", "bus3126"), ("bus3126", "bus3127"), ("bus3127", "bus3128"), ("bus3128", "bus3129"),
-    ("bus3129", "bus3130"), ("bus3130", "bus3131"), ("bus3118", "bus3132"), ("bus3132", "bus3133"),
-    ("bus3133", "bus3134"), ("bus3134", "bus3135"), ("bus3135", "bus3136"), ("bus3133", "bus3137"),
-    ("bus3137", "bus3138"), ("bus3138", "bus3139"), ("bus3107", "bus3140"), ("bus3140", "bus3141"),
-    ("bus3141", "bus3142"), ("bus3142", "bus3143"), ("bus3140", "bus3148"), ("bus3148", "bus3149"),
-    ("bus3149", "bus3150"), ("bus3150", "bus3151"), ("bus3151", "bus3152"), ("bus3152", "bus3153"),
-    ("bus3153", "bus3154"), ("bus3154", "bus3155"), ("bus3140", "bus3156"), ("bus3156", "bus3144"),
-    ("bus3144", "bus3145"), ("bus3145", "bus3146"), ("bus3146", "bus3147"), ("bus3156", "bus3157"),
-    ("bus3157", "bus3158"), ("bus3158", "bus3159"), ("bus3159", "bus3160"), ("bus3160", "bus3161"),
-    ("bus3161", "bus3162")
+    ("bus3089", "bus3090"), ("bus3090", "bus3091"), ("bus3092", "bus3098"), ("bus3098", "bus3099"),
+    ("bus3092", "bus3100"), ("bus3100", "bus3101"), ("bus3101", "bus3102"), ("bus3102", "bus3103"),
+    ("bus3100", "bus3104"), ("bus3104", "bus3105"), ("bus3105", "bus3106"), ("bus3082", "bus3107"),
+    ("bus3107", "bus3108"), ("bus3108", "bus3109"), ("bus3109", "bus3110"), ("bus3110", "bus3111"),
+    ("bus3111", "bus3112"), ("bus3107", "bus3113"), ("bus3113", "bus3114"), ("bus3114", "bus3115"),
+    ("bus3113", "bus3116"), ("bus3116", "bus3117"), ("bus3107", "bus3118"), ("bus3118", "bus3119"),
+    ("bus3119", "bus3120"), ("bus3120", "bus3121"), ("bus3121", "bus3122"), ("bus3119", "bus3123"),
+    ("bus3123", "bus3124"), ("bus3124", "bus3125"), ("bus3125", "bus3126"), ("bus3126", "bus3127"),
+    ("bus3127", "bus3128"), ("bus3128", "bus3129"), ("bus3129", "bus3130"), ("bus3130", "bus3131"),
+    ("bus3118", "bus3132"), ("bus3132", "bus3133"), ("bus3133", "bus3134"), ("bus3134", "bus3135"),
+    ("bus3135", "bus3136"), ("bus3133", "bus3137"), ("bus3137", "bus3138"), ("bus3138", "bus3139"),
+    ("bus3107", "bus3140"), ("bus3140", "bus3141"), ("bus3141", "bus3142"), ("bus3142", "bus3143"),
+    ("bus3140", "bus3148"), ("bus3148", "bus3149"), ("bus3149", "bus3150"), ("bus3150", "bus3151"),
+    ("bus3151", "bus3152"), ("bus3152", "bus3153"), ("bus3153", "bus3154"), ("bus3154", "bus3155"),
+    ("bus3140", "bus3156"), ("bus3156", "bus3144"), ("bus3144", "bus3145"), ("bus3145", "bus3146"),
+    ("bus3146", "bus3147"), ("bus3156", "bus3157"), ("bus3157", "bus3158"), ("bus3158", "bus3159"),
+    ("bus3159", "bus3160"), ("bus3160", "bus3161"), ("bus3161", "bus3162")
 ]
 
 TRANSFORMER_NODES = ["bus1003", "bus1004", "bus1005", "bus1006", "bus1007", "bus1008", 
@@ -506,11 +500,27 @@ def get_distance_map():
     d_map = {}
     source_x, source_y = bus_dict['bus1']
     for b_name, (bx, by) in bus_dict.items():
+        # *** WEAK GRID PHYSICS: Scale distances by 5x to simulate Rural Feeder ***
         dist = np.sqrt((bx - source_x)**2 + (by - source_y)**2)
-        d_map[b_name] = dist
+        d_map[b_name] = dist * 5.0 # Rural Feeder Scaling
     return d_map
 
 dist_map = get_distance_map()
+
+# --- NEW: DYNAMIC SOLAR SITE GENERATION (SPATIAL PENETRATION) ---
+# We designate 70% of total buses as "Potential Solar Sites"
+# This list is static, but the *active* portion changes with the slider
+random.seed(42) # Deterministic for stability
+POTENTIAL_SOLAR_SITES = random.sample([b for b in bus_list if b not in TRANSFORMER_NODES and b != "bus1"], k=int(len(bus_list)*0.7))
+
+# Assign Fixed Capacities (Residential 10kW vs Commercial 50kW)
+# 80% Residential (10kW), 20% Commercial (50kW)
+SOLAR_SITE_CAPACITY = {}
+for site in POTENTIAL_SOLAR_SITES:
+    if random.random() < 0.8:
+        SOLAR_SITE_CAPACITY[site] = 60.0 # 10 kW Residential (Iowa Standard)
+    else:
+        SOLAR_SITE_CAPACITY[site] = 250.0 # 50 kW Commercial
 
 # ----------------------------------------------------------
 # 4. SESSION STATE & PHYSICS VARS
@@ -545,6 +555,7 @@ if "apfc_auto_mode" not in st.session_state: st.session_state.apfc_auto_mode = F
 
 if "tap_position" not in st.session_state: st.session_state.tap_position = 1.0 
 if "auto_tap_mode" not in st.session_state: st.session_state.auto_tap_mode = False
+if "tap_moves_count" not in st.session_state: st.session_state.tap_moves_count = 0
 
 # NEW: Cyber Attack
 if "fdi_attack" not in st.session_state: st.session_state.fdi_attack = False
@@ -552,6 +563,10 @@ if "fdi_attack" not in st.session_state: st.session_state.fdi_attack = False
 # NEW: Cloud Shading & BESS
 if "cloud_shading" not in st.session_state: st.session_state.cloud_shading = False
 if "bess_soc" not in st.session_state: st.session_state.bess_soc = 50.0 
+
+# NEW: SPATIAL PENETRATION LEVEL (0-100%)
+if "spatial_penetration_pct" not in st.session_state: st.session_state.spatial_penetration_pct = 10
+if "enable_smart_inverter" not in st.session_state: st.session_state.enable_smart_inverter = False
 
 if "room_temp" not in st.session_state: st.session_state.room_temp = 28.0
 if "hvac_on" not in st.session_state: st.session_state.hvac_on = False
@@ -577,6 +592,12 @@ if "solar_q_history" not in st.session_state: st.session_state.solar_q_history =
 if "solar_v_history" not in st.session_state: st.session_state.solar_v_history = [1.0] * 50
 if "solar_irr_history" not in st.session_state: st.session_state.solar_irr_history = [0.0] * 50
 if "solar_temp_history" not in st.session_state: st.session_state.solar_temp_history = [25.0] * 50
+
+# --- NEW: GRID ANALYTICS BUFFERS ---
+if "global_v_history" not in st.session_state: st.session_state.global_v_history = [1.0] * 50
+if "global_pf_history" not in st.session_state: st.session_state.global_pf_history = [0.95] * 50
+if "global_j_history" not in st.session_state: st.session_state.global_j_history = [0.0] * 50
+
 
 if "audit_log" not in st.session_state: 
     st.session_state.audit_log = pd.DataFrame(columns=["Timestamp", "Event", "Type", "Details"])
@@ -758,13 +779,15 @@ def convert_seq_to_phase(I0, I1, I2):
 def calculate_voltage_profile(bus_name, p_load_kw, q_load_kvar, tap_pos, p_gen_kw=0.0, q_gen_kvar=0.0):
     """
     Enhanced Physics: Calculates Voltage Drop considering Load and Generation.
-    Now includes q_gen_kvar for Smart Inverter Volt-VAR logic.
+    Now includes REVERSE POWER FLOW logic causing VOLTAGE RISE.
     """
     dist = dist_map.get(bus_name, 1.0)
     if dist < 1e-6: dist = 1e-6 
     
     # Net Power at Bus (Load - Generation)
+    # If p_gen > p_load, p_net is negative, meaning power flows TO source
     p_net = p_load_kw - p_gen_kw
+    
     # Net Reactive Power (Load - Inverter Injection)
     q_net = q_load_kvar - q_gen_kvar
     
@@ -775,8 +798,11 @@ def calculate_voltage_profile(bus_name, p_load_kw, q_load_kvar, tap_pos, p_gen_k
     s_apparent_net = complex(p_net, q_net) / 1000.0
     
     # I = (S/V)*
+    # If P is negative (Reverse Flow), Current angle shifts 180 deg
     i_approx = s_apparent_net.conjugate() / v_source
     
+    # V_load = V_source - (I * Z)
+    # If I is negative (flowing back), this subtracts a negative, resulting in ADDITION (Voltage Rise)
     v_drop = i_approx * z_line
     v_load = v_source - v_drop
     
@@ -977,45 +1003,46 @@ def get_solar_contribution(idx):
         elif 15 <= h < 19: return 1.0 - (0.25 * (h - 15))
         return 0.0
 
-def calculate_pv_physics(bus_name, idx, ambient_temp):
+def calculate_pv_physics(bus_name, idx, ambient_temp, penetration_multiplier=1.0):
     """
     Mathematically rigorous PV calculation.
+    Now accepts 'penetration_multiplier' to simulate INSTABILITY.
     Returns: P_gen (kW), Cell_Temp (C), Irradiance (0-1)
     """
-    if bus_name not in SOLAR_BUS_CONFIG: return 0.0, ambient_temp, 0.0
+    # *** MOVED GLOBAL HELPER FUNCTION FOR TOPOLOGY RENDERER ***
+    # Determine the subset of active buses based on slider
+    # Note: 'penetration_multiplier' is used here as 'spatial_penetration_pct'
+    count_active = int(len(POTENTIAL_SOLAR_SITES) * penetration_multiplier / 100.0)
+    active_buses = POTENTIAL_SOLAR_SITES[:count_active]
     
-    capacity = SOLAR_BUS_CONFIG[bus_name]
-    irradiance = get_solar_contribution(idx) # "Suns" (0-1, where 1=1000W/m2)
+    if bus_name not in active_buses:
+        return 0.0, ambient_temp, 0.0
+    
+    # If active, get its assigned capacity (Residential or Commercial)
+    capacity = SOLAR_SITE_CAPACITY.get(bus_name, 10.0)
+    
+    irradiance = get_solar_contribution(idx) # "Suns"
     
     # 1. Cloud Shading Logic (Global Override)
     if st.session_state.cloud_shading:
         irradiance *= 0.3 # 70% Drop
     
-    # 2. Cell Temperature Calculation (Standard Model)
-    # T_cell = T_amb + (NOCT - 20)/800 * G_watts
-    # We assume irradiance 1.0 = 800 W/m2 NOCT standard, scaled
+    # 2. Cell Temperature Calculation
     t_cell = ambient_temp + ((NOCT - 20.0) / 0.8) * irradiance
     
     # 3. Active Power with Temperature Degradation
-    # P = P_rated * Irradiance * (1 + gamma * (T_cell - 25))
     temp_loss_factor = 1.0 + (TEMP_COEFF * (t_cell - STC_TEMP))
-    
-    # Clamp factor to avoid physics glitch at extreme temps
     temp_loss_factor = max(0.5, min(1.2, temp_loss_factor))
     
     p_gen_ideal = capacity * irradiance
     p_gen_real = p_gen_ideal * temp_loss_factor
     
-    # Add minor noise for realism
-    noise = np.random.uniform(0.99, 1.01)
-    
+    noise = np.random.uniform(0.98, 1.02)
     return p_gen_real * noise, t_cell, irradiance
 
 def smart_inverter_logic(v_pu, p_available_kw, capacity_kw):
     """
     IEEE 1547 compliant Smart Inverter Functions
-    1. Volt-Watt Curtailment: Reduce P if V > 1.05
-    2. Volt-VAR Control: Absorb Q if V > 1.02, Inject Q if V < 0.98
     """
     p_out = p_available_kw
     q_out = 0.0
@@ -1043,33 +1070,33 @@ def smart_inverter_logic(v_pu, p_available_kw, capacity_kw):
 
 def bess_dispatch_logic(net_load_kw, current_hour):
     """
-    Battery Energy Storage System (Peak Shaving)
-    Charge: Early morning or when Solar > Load
-    Discharge: Evening Peak (18:00 - 22:00)
+    BESS LOGIC DISABLED PER INSTRUCTIONS
     """
-    h = current_hour % 24
-    p_bess = 0.0 # +Discharge, -Charge
-    mode = "IDLE"
+    return 0.0, "DISABLED (Solar Only Mode)"
+
+# --- HELPER FUNCTION FOR TOPOLOGY RENDERING (MOVED HERE TO FIX NAME ERROR) ---
+def get_node_sim_data(bus_name, current_idx):
+    try:
+        p_kw = df_fa_p[bus_name].iloc[current_idx]
+        q_kvar = df_fa_p[bus_name].iloc[current_idx] * 0.4
+    except KeyError:
+        base_load = 50.0
+        if "30" in bus_name: base_load = 80.0
+        p_kw = base_load + (10 * np.sin(current_idx * 0.1)) + np.random.uniform(-2, 2)
+        q_kvar = p_kw * 0.3
+
+    # PV Injection
+    pv_out, _, _ = calculate_pv_physics(bus_name, current_idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct)
+
+    # Use Physics Engine for Voltage (Reverse Power Flow Aware)
+    v_pu = calculate_voltage_profile(bus_name, p_kw, q_kvar, st.session_state.tap_position, p_gen_kw=pv_out)
     
-    soc = st.session_state.bess_soc
+    # Net Power for Current Calc
+    p_net = p_kw - pv_out
+    i_amps = (np.sqrt(p_net**2 + q_kvar**2) / (0.208 * 1.732)) if bus_name not in TRANSFORMER_NODES else 0.0
+    pf = p_net / np.sqrt(p_net**2 + q_kvar**2) if p_net > 0 else 1.0
     
-    # Dispatch Strategy
-    if 10 <= h <= 15: # Solar Peak -> Charge
-        if soc < 95.0:
-            p_bess = -0.8 * BESS_MAX_POWER
-            mode = "CHARGING (Solar Soak)"
-    elif 18 <= h <= 22: # Evening Peak -> Discharge
-        if soc > 20.0:
-            p_bess = 1.0 * BESS_MAX_POWER
-            mode = "DISCHARGING (Peak Shave)"
-            
-    # Update SoC
-    energy_delta = (p_bess * -1.0) / 60.0 # Assuming 1 min sim steps roughly for demo visuals
-    if st.session_state.run_simulation:
-         new_soc = soc + (energy_delta / BESS_CAPACITY_KWH * 100)
-         st.session_state.bess_soc = max(0.0, min(100.0, new_soc))
-         
-    return p_bess, mode
+    return v_pu, i_amps, p_kw, q_kvar, pf, pv_out
 
 # --- CYBERPUNK PLOTTING FUNCTIONS ---
 def make_cyber_meter(value, delta_val, title, min_val, max_val, color_hex):
@@ -1268,12 +1295,19 @@ with st.sidebar:
             st.session_state.mech_power = 5000.0
             st.session_state.fdi_attack = False
             st.session_state.bess_soc = 50.0
+            st.session_state.solar_multiplier_global = 1.0
+            st.session_state.enable_smart_inverter = False
+            st.session_state.tap_moves_count = 0
             # Clear solar buffers
             st.session_state.solar_p_history = [0.0] * 50
             st.session_state.solar_q_history = [0.0] * 50
             st.session_state.solar_v_history = [1.0] * 50
             st.session_state.solar_irr_history = [0.0] * 50
             st.session_state.solar_temp_history = [25.0] * 50
+            # Clear new grid analytics buffers
+            st.session_state.global_v_history = [1.0] * 50
+            st.session_state.global_pf_history = [0.95] * 50
+            st.session_state.global_j_history = [0.0] * 50
             
             st.session_state.audit_log = pd.DataFrame(columns=["Timestamp", "Event", "Type", "Details"])
             log_event("System", "Reset", "Hard Reboot Initiated")
@@ -1380,13 +1414,13 @@ def render_home():
     # Base Loads
     p_load_total = row["Total_Active_Power"] + st.session_state.hvac_load_kw
     
-    # Total Solar Generation (Driven by Physics)
+    # Total Solar Generation (Dynamic based on Penetration)
     total_pv_gen = 0.0
-    for bus_name in SOLAR_BUS_CONFIG.keys():
-        p_val, _, _ = calculate_pv_physics(bus_name, idx, st.session_state.room_temp)
+    for bus_name in POTENTIAL_SOLAR_SITES:
+        p_val, _, _ = calculate_pv_physics(bus_name, idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct)
         total_pv_gen += p_val
         
-    # BESS Dispatch
+    # BESS Dispatch - DISABLED
     p_bess, bess_mode = bess_dispatch_logic(p_load_total - total_pv_gen, idx)
     
     # Net Grid Load
@@ -1423,11 +1457,11 @@ def render_home():
     # --- METRICS ROW ---
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     col_s1.metric("TOTAL SOLAR PV", f"{total_pv_gen:.1f} kW", delta="Cloud Effect" if st.session_state.cloud_shading else "Optimal")
-    col_s2.metric("BESS STATUS", f"{st.session_state.bess_soc:.1f}% SoC", delta=bess_mode)
+    col_s2.metric("BESS STATUS", "OFFLINE", delta="Disabled")
     col_s3.metric("GRID NET LOAD", f"{p_grid_net:.1f} kW")
-    # Penetration Metric - Requested by User
-    penetration_pct = (total_pv_gen / p_load_total * 100) if p_load_total > 0 else 0
-    col_s4.metric("PV PENETRATION", f"{penetration_pct:.1f} %", delta="Load Response")
+    # Penetration Metric
+    penetration_display_pct = st.session_state.spatial_penetration_pct
+    col_s4.metric("SOLAR PENETRATION", f"{penetration_display_pct} %", delta="Spatial Expansion")
     
     # --- PLOTS ROW ---
     hist_window = 60
@@ -1437,32 +1471,90 @@ def render_home():
     h_solar, h_grid, h_pen = [], [], []
     for k in hist_indices:
         s_gen = 0.0
-        for b in SOLAR_BUS_CONFIG:
-            pv, _, _ = calculate_pv_physics(b, k, st.session_state.room_temp)
-            s_gen += pv
-        # Apply rough BESS calc for history consistency
-        b_p, _ = bess_dispatch_logic(df_raw["Total_Active_Power"].iloc[k % len(df_raw)] - s_gen, k)
+        # Quick estimation for history plot
+        irradiance_k = get_solar_contribution(k)
+        active_count = int(len(POTENTIAL_SOLAR_SITES) * st.session_state.spatial_penetration_pct / 100.0)
+        for b in POTENTIAL_SOLAR_SITES[:active_count]:
+             s_gen += SOLAR_SITE_CAPACITY[b] * irradiance_k
         
         base_load = df_raw["Total_Active_Power"].iloc[k % len(df_raw)]
-        net_grid = base_load - s_gen - b_p
-        pen = (s_gen / base_load * 100) if base_load > 0 else 0
+        net_grid = base_load - s_gen
         h_solar.append(s_gen)
         h_grid.append(net_grid)
-        h_pen.append(pen)
+        h_pen.append(st.session_state.spatial_penetration_pct)
 
     c_p1, c_p2, c_p3 = st.columns(3)
     with c_p1: st.plotly_chart(make_cyber_plot(hist_indices, h_solar, "SOLAR GENERATION (kW)", "#ffff00", height=150), use_container_width=True)
     with c_p2: st.plotly_chart(make_cyber_plot(hist_indices, h_grid, "NET GRID LOAD (kW)", "#00f3ff", height=150), use_container_width=True)
-    with c_p3: st.plotly_chart(make_cyber_plot(hist_indices, h_pen, "PV PENETRATION (%)", "#00ff00", height=150), use_container_width=True)
+    with c_p3: st.plotly_chart(make_cyber_plot(hist_indices, h_pen, "PENETRATION (SITES %)", "#00ff00", height=150), use_container_width=True)
 
     max_p = max(3000, p_load_total * 1.5) 
     max_q = max(2000, q_val * 1.5)
 
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(make_cyber_meter(p_grid_net, delta_p, "NET ACTIVE POWER (kW)", 0, max_p, "#00f3ff"), use_container_width=True, key="gauge_p")
+        st.plotly_chart(make_cyber_meter(p_grid_net, delta_p, "NET ACTIVE POWER (kW)", -max_p, max_p, "#00f3ff"), use_container_width=True, key="gauge_p")
     with c2:
         st.plotly_chart(make_cyber_meter(q_val, delta_q, "REACTIVE POWER (kVAR)", 0, max_q, "#ff00ff"), use_container_width=True, key="gauge_q")
+
+    # -----------------------------------------------------
+    # NEW: GRID ANALYTICS SECTION (MOVED TO LIVE TELEMETRY)
+    # -----------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 🌐 GRID WIDE ANALYTICS")
+    
+    # Global Physics & Calc
+    g_p_total = df_raw["Total_Active_Power"].iloc[idx]
+    g_q_total = df_raw["Total_Reac_Power"].iloc[idx]
+    
+    # Global PF
+    g_denom = np.sqrt(g_p_total**2 + g_q_total**2)
+    g_pf = g_p_total / g_denom if g_denom > 0 else 1.0
+    
+    # Global Avg Voltage (Heuristic based on Source Tap - System Load Droop)
+    # Simulating the average voltage across the distribution network
+    # LINKED TO NET LOAD (Includes Solar) to show Reverse Flow Voltage Rise
+    voltage_sensitivity = 150000.0 # Sensitivity factor
+    g_avg_voltage = st.session_state.tap_position - (p_grid_net / voltage_sensitivity)
+    g_avg_voltage = apply_scada_noise(g_avg_voltage, 0.002)
+    
+    # Global SE (Aggregation of residuals)
+    # If attack is active, global residual spikes
+    g_se_resid = 0.02 + np.random.uniform(0, 0.01)
+    if st.session_state.fdi_attack: g_se_resid += 0.15
+    if st.session_state.fault_active: g_se_resid += 0.08
+    
+    # Update Histories
+    st.session_state.global_v_history.append(g_avg_voltage)
+    st.session_state.global_pf_history.append(g_pf)
+    st.session_state.global_j_history.append(g_se_resid)
+    
+    # --- VOLTAGE LIMIT CHECK LOGIC ---
+    v_status_label = "NOMINAL RANGE"
+    v_status_color = "normal"
+    v_status_suggestion = "System Stable"
+
+    if g_avg_voltage > 1.05:
+        v_status_label = "HIGH VOLTAGE"
+        v_status_color = "inverse"
+        v_status_suggestion = "SUGGESTION: Lower Tap Position / Reduce Cap Banks"
+    elif g_avg_voltage < 0.95:
+        v_status_label = "LOW VOLTAGE"
+        v_status_color = "inverse"
+        v_status_suggestion = "SUGGESTION: Raise Tap Position / Inject VARs"
+    # ---------------------------------
+    
+    # Layout
+    ga1, ga2, ga3 = st.columns(3)
+    ga1.metric("AVG GRID VOLTAGE", f"{g_avg_voltage:.3f} pu", delta=v_status_label, delta_color=v_status_color)
+    ga2.metric("GRID POWER FACTOR", f"{g_pf:.3f}", delta=v_status_suggestion, delta_color="off")
+    ga3.metric("GLOBAL STATE EST. (J)", f"{g_se_resid:.4f}", delta="Converged" if g_se_resid < 0.05 else "Diverged", delta_color="inverse")
+    
+    # Plots
+    gp1, gp2, gp3 = st.columns(3)
+    with gp1: st.plotly_chart(make_cyber_plot(list(range(len(st.session_state.global_v_history))), st.session_state.global_v_history, "GRID VOLTAGE PROFILE (Avg)", "#00f3ff", height=150), use_container_width=True)
+    with gp2: st.plotly_chart(make_cyber_plot(list(range(len(st.session_state.global_pf_history))), st.session_state.global_pf_history, "GRID POWER FACTOR", "#ffae00", height=150), use_container_width=True)
+    with gp3: st.plotly_chart(make_cyber_plot(list(range(len(st.session_state.global_j_history))), st.session_state.global_j_history, "GLOBAL SE RESIDUAL (J)", "#ff0055", height=150), use_container_width=True)
 
     st.markdown("---")
     render_hvac()
@@ -1480,49 +1572,85 @@ def render_feeder(view_bus):
     display_p = raw_p
     display_q = raw_p * 0.4
     
+    # --- DYNAMIC SOLAR PENETRATION SLIDER ---
+    st.markdown(f"### ☀️ SOLAR PENETRATION CONTROL (Spatial)")
+    st.caption("Adjust percentage of grid nodes with active solar installations.")
+    spatial_input = st.slider("GRID PENETRATION (%)", 0, 100, st.session_state.spatial_penetration_pct, key="spatial_slider")
+    st.session_state.spatial_penetration_pct = spatial_input
+    
+    # *** NEW: SMART INVERTER TOGGLE ***
+    smart_enabled = st.checkbox("ENABLE SMART INVERTER (IEEE 1547)", value=st.session_state.enable_smart_inverter, help="Toggle to enable Volt-Watt and Volt-VAR control to fix instability.")
+    st.session_state.enable_smart_inverter = smart_enabled
+    
+    # Calculate how many sites are active
+    active_site_count = int(len(POTENTIAL_SOLAR_SITES) * spatial_input / 100.0)
+    st.metric("ACTIVE SOLAR SITES", f"{active_site_count} / {len(POTENTIAL_SOLAR_SITES)}")
+
     # --- PV & SMART INVERTER CALCULATIONS ---
-    # Use upgraded physics calc
-    pv_output, cell_temp, irradiance = calculate_pv_physics(view_bus, idx, st.session_state.room_temp)
-    has_pv = view_bus in SOLAR_BUS_CONFIG
+    pv_output, cell_temp, irradiance = calculate_pv_physics(view_bus, idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct)
+    
+    has_pv = pv_output > 0 or (view_bus in POTENTIAL_SOLAR_SITES and view_bus in POTENTIAL_SOLAR_SITES[:active_site_count])
     
     # Initial Voltage Calc for Smart Logic
     v_pre = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=pv_output)
     
-    smart_p, smart_q, smart_status = pv_output, 0.0, "Passive"
-    if has_pv:
-        smart_p, smart_q, smart_status = smart_inverter_logic(v_pre, pv_output, SOLAR_BUS_CONFIG[view_bus])
+    smart_p, smart_q, smart_status = pv_output, 0.0, "Passive (Grid Following)"
     
-    # Final Voltage with Smart Inverter Actions
+    # *** CRITICAL UPDATE: Bypass Smart Inverter unless Enabled ***
+    if has_pv:
+        if st.session_state.enable_smart_inverter:
+            capacity = SOLAR_SITE_CAPACITY.get(view_bus, 10.0)
+            smart_p, smart_q, smart_status = smart_inverter_logic(v_pre, pv_output, capacity)
+        else:
+            smart_status = "DISABLED (Instability Test Mode)"
+    
+    # Final Voltage with Smart Inverter Actions (Includes Reverse Flow Logic)
     voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
     
-    # Hosting Capacity Check
-    hc_status = "OK"
-    hc_col = "normal"
-    if voltage_pu_phys > 1.045: 
-        hc_status = "CRITICAL (Limit Reached)"
-        hc_col = "inverse"
-    elif voltage_pu_phys > 1.03:
-        hc_status = "MODERATE"
-    
-    # --- AUTO-TAP CHANGER LOGIC (AVR) ---
+    # --- FIXED: IMPROVED AUTO-TAP CHANGER LOGIC (AVR) ---
+    avr_status = "IDLE"
     if st.session_state.auto_tap_mode and not st.session_state.relay_trip:
-        if voltage_pu_phys < 0.96:
-            st.session_state.tap_position = min(1.10, st.session_state.tap_position + 0.005)
-        elif voltage_pu_phys > 1.04:
-            st.session_state.tap_position = max(0.90, st.session_state.tap_position - 0.005)
-    # ------------------------------------
+        did_tap_change = False
+        step_change = 0.005 # 0.5% Step
+        
+        # Upper Limit Check (Reduce Voltage)
+        if voltage_pu_phys > 1.04: 
+            if st.session_state.tap_position > 0.90:
+                st.session_state.tap_position -= step_change
+                did_tap_change = True
+                avr_status = "LOWERING TAPS 🔻"
+        
+        # Lower Limit Check (Boost Voltage)
+        elif voltage_pu_phys < 0.96:
+            if st.session_state.tap_position < 1.10:
+                st.session_state.tap_position += step_change
+                did_tap_change = True
+                avr_status = "RAISING TAPS 🔺"
+        
+        if did_tap_change:
+            # Teacher Requirement: Count Operations (Stress)
+            st.session_state.tap_moves_count += 1
+            # Re-Calculate Voltage IMMEDIATELY so UI updates instantly
+            voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
+            
+            if st.session_state.tap_moves_count % 10 == 0:
+                 log_event("Equipment", "Stress", f"High Tap Frequency: {st.session_state.tap_moves_count} ops")
+    # ----------------------------------------------------
 
-    # 2. SCADA Layer: Add Noise
-    measured_v = apply_scada_noise(voltage_pu_phys, 0.01)
-    measured_p = apply_scada_noise(display_p - smart_p, 1.0) # SCADA sees Net Load
-    measured_q = apply_scada_noise(display_q - smart_q, 1.0)
+    # --- TECHNICAL IMPACTS ANALYSIS ---
+    reverse_flow = smart_p > display_p
+    net_p_flow = display_p - smart_p
+    voltage_rise_pct = (voltage_pu_phys - 1.0) * 100
+    xfmr_limit = 200.0 
+    xfmr_loading = abs(net_p_flow) / xfmr_limit * 100
     
-    # 3. State Estimation (SE) Engine
+    measured_v = apply_scada_noise(voltage_pu_phys, 0.01)
+    measured_p = apply_scada_noise(net_p_flow, 1.0)
+    measured_q = apply_scada_noise(display_q - smart_q, 1.0)
     estimated_v, se_resid, se_chi = run_wls_state_estimation(measured_v, measured_p, measured_q, view_bus)
 
     is_local_fault = False
     relay_msg = "MONITORING"
-    
     i0, i1, i2 = 0.0, 0.0, 0.0
     Ia, Ib, Ic = 0.8, 0.8, 0.8 # approx PU
     Id, Ibd, Icd = 0, -120, 120 # angles
@@ -1562,25 +1690,22 @@ def render_feeder(view_bus):
         i2 = i1 * 0.05 
         i0 = i1 * 0.02
         Ia = Ib = Ic = abs(i1)
+        
+        # Phase shift if reverse flow
+        if reverse_flow:
+            Id += 180
+            Ibd += 180
+            Icd += 180
 
     delta_feeder = display_p - st.session_state.prev_feeder_p
     st.session_state.prev_feeder_p = display_p
     
-    # -- UPDATE PLOT BUFFERS --
+    # -- UPDATE PLOT BUFFERS (INFINITE HISTORY) --
     st.session_state.history_tap.append(st.session_state.tap_position)
-    if len(st.session_state.history_tap) > 50: st.session_state.history_tap.pop(0)
-
     st.session_state.history_cap.append(st.session_state.capacitor_bank_kvAr)
-    if len(st.session_state.history_cap) > 24: st.session_state.history_cap.pop(0) 
-    
     st.session_state.history_se_meas.append(measured_v)
-    if len(st.session_state.history_se_meas) > 50: st.session_state.history_se_meas.pop(0)
-    
     st.session_state.history_se_est.append(estimated_v)
-    if len(st.session_state.history_se_est) > 50: st.session_state.history_se_est.pop(0)
-    
     st.session_state.history_se_j.append(se_chi)
-    if len(st.session_state.history_se_j) > 50: st.session_state.history_se_j.pop(0)
 
     # -- UPDATE SOLAR PHYSICS BUFFERS --
     st.session_state.solar_p_history.append(smart_p)
@@ -1588,11 +1713,6 @@ def render_feeder(view_bus):
     st.session_state.solar_v_history.append(voltage_pu_phys)
     st.session_state.solar_irr_history.append(irradiance)
     st.session_state.solar_temp_history.append(cell_temp)
-    
-    for hist_list in [st.session_state.solar_p_history, st.session_state.solar_q_history, 
-                      st.session_state.solar_v_history, st.session_state.solar_irr_history, 
-                      st.session_state.solar_temp_history]:
-        if len(hist_list) > 50: hist_list.pop(0)
 
     pf_denom = np.sqrt((display_p - smart_p)**2 + (display_q - st.session_state.capacitor_bank_kvAr)**2)
     pf_final = (display_p - smart_p) / pf_denom if pf_denom > 0 else 1.0
@@ -1606,7 +1726,7 @@ def render_feeder(view_bus):
     st.session_state.capacitor_bank_kvAr = max(0.0, min(200.0, st.session_state.capacitor_bank_kvAr))
 
     st.markdown(f"### 🔍 FEEDER: **{view_bus}**")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("STATUS", "TRIPPED" if st.session_state.relay_trip else ("FAULT" if is_local_fault else "OK"))
     m2.metric("RAW LOAD", f"{display_p:.1f} kW", delta=f"{delta_feeder:.1f} kW")
     
@@ -1615,30 +1735,73 @@ def render_feeder(view_bus):
     
     m3.metric("SE VOLTAGE", f"{estimated_v:.3f} pu", delta=se_delta_msg, delta_color="normal" if "BAD" not in se_delta_msg else "inverse")
     m4.metric("PROTECTION", relay_msg)
+    m5.metric("OLTC OPS (WEAR)", f"{st.session_state.tap_moves_count}", delta="Mechanical Stress", delta_color="inverse")
+
+    # --- NEW: TECHNICAL IMPACTS DASHBOARD ---
+    if has_pv:
+        st.markdown("---")
+        st.markdown("### ⚡ TECHNICAL IMPACTS: REVERSE POWER FLOW ANALYSIS")
+        
+        impact_cols = st.columns(4)
+        
+        # Impact 1: Voltage Rise
+        v_color = "normal"
+        v_status = "STABLE"
+        if voltage_pu_phys > 1.05: 
+            v_color = "inverse"
+            v_status = "CRITICAL RISE"
+        elif voltage_pu_phys > 1.03: 
+            v_color = "off"
+            v_status = "WARNING"
+            
+        impact_cols[0].metric(
+            "1. VOLTAGE RISE", 
+            f"{voltage_pu_phys:.3f} pu", 
+            delta=v_status, 
+            delta_color=v_color
+        )
+        
+        # Impact 2: Transformer Stress
+        t_color = "normal"
+        t_status = "FORWARD FLOW"
+        if reverse_flow:
+            t_status = "REVERSE FLOW"
+            if xfmr_loading > 100: 
+                t_color = "inverse"
+                t_status = "OVERLOAD (REV)"
+            else:
+                t_color = "off"
+        
+        impact_cols[1].metric(
+            "2. XFMR LOADING", 
+            f"{xfmr_loading:.1f} %", 
+            delta=t_status, 
+            delta_color=t_color
+        )
+        
+        # Impact 3: Protection
+        p_status = "COORDINATED"
+        p_delta = "OK"
+        p_col = "normal"
+        if reverse_flow:
+            p_status = "BLIND SPOT"
+            p_delta = "RELAY CONFUSION"
+            p_col = "inverse"
+            
+        impact_cols[2].metric(
+            "3. PROTECTION", 
+            p_status, 
+            delta=p_delta, 
+            delta_color=p_col
+        )
+        
+        # Impact 4: Power Quality / Congestion
+        cong_status = "FREE"
+        if abs(net_p_flow) > 150: cong_status = "CONGESTED"
+        impact_cols[3].metric("4. CONGESTION", cong_status, delta=f"{net_p_flow:.1f} kW Net")
 
     # --- SOLAR & HOSTING CAPACITY VISUALIZATION ---
     if has_pv:
-        st.markdown(f"""
-        <div style="background: rgba(255, 255, 0, 0.1); border: 1px solid #ffff00; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-            <div style="display: flex; justify-content: space-between;">
-                <div>
-                    <h4 style="color: #ffff00; margin:0;">☀️ SMART PV SYSTEM (PHYSICS MODEL)</h4>
-                    <span style="color: #ddd;">Generating: <b>{smart_p:.2f} kW</b> | Reactive Inj: <b>{smart_q:.1f} kVAR</b></span><br>
-                    <span style="color: #bbb; font-size:12px;">Cell Temp: {cell_temp:.1f}°C (Eff Loss: {abs(TEMP_COEFF*(cell_temp-STC_TEMP)*100):.1f}%)</span>
-                </div>
-                <div style="text-align: right;">
-                    <span style="color: #00f3ff; font-weight: bold;">IEEE 1547 MODE:</span><br>
-                    <span style="color: #fff;">{smart_status}</span>
-                </div>
-            </div>
-            <hr style="border-color: #333;">
-            <div style="display: flex; justify-content: space-between; font-size: 12px;">
-                <span style="color: #ddd;">HOSTING CAPACITY STATUS:</span>
-                <span style="color: {'#ff0055' if 'CRITICAL' in hc_status else '#00ff00'}; font-weight: bold;">{hc_status}</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
         # --- NEW PHYSICS PLOTS EXPANDER ---
         with st.expander("☀️ SOLAR PV PHYSICS WORKBENCH", expanded=True):
             p_hist = st.session_state.solar_p_history
@@ -1650,7 +1813,7 @@ def render_feeder(view_bus):
 
             # PLOT 1: ACTIVE POWER vs THERMAL PHYSICS
             fig_p = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_p.add_trace(go.Scatter(x=x_ax, y=p_hist, name="Active Power (P)", line=dict(color="#ffff00", width=3), fill='tozeroy'), secondary_y=False)
+            fig_p.add_trace(go.Scatter(x=x_ax, y=p_hist, name="Solar Gen (P)", line=dict(color="#ffff00", width=3), fill='tozeroy'), secondary_y=False)
             fig_p.add_trace(go.Scatter(x=x_ax, y=t_hist, name="Cell Temp (°C)", line=dict(color="#ff0055", width=1, dash='dot')), secondary_y=True)
             fig_p.update_layout(title="PV ACTIVE POWER & THERMAL DEGRADATION", height=200, margin=dict(l=10, r=10, t=30, b=10), 
                                 paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.3)', font=dict(color="#ccc", family="Orbitron"))
@@ -1675,10 +1838,10 @@ def render_feeder(view_bus):
                 fig_v = go.Figure()
                 fig_v.add_trace(go.Scatter(x=x_ax, y=v_hist, name="PCC Voltage", line=dict(color="#00f3ff", width=2)))
                 fig_v.add_hline(y=1.0, line_dash="dash", line_color="gray")
-                fig_v.add_hline(y=1.05, line_color="red", line_width=1)
-                fig_v.update_layout(title="PCC VOLTAGE PROFILE (pu)", height=200, margin=dict(l=10, r=10, t=30, b=10), 
+                fig_v.add_hline(y=1.05, line_color="red", line_width=2, annotation_text="Limit")
+                fig_v.update_layout(title="VOLTAGE PROFILE (Reverse Flow Impact)", height=200, margin=dict(l=10, r=10, t=30, b=10), 
                                     paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.3)', font=dict(color="#ccc", family="Orbitron"),
-                                    yaxis=dict(gridcolor='#333', range=[0.9, 1.1]))
+                                    yaxis=dict(gridcolor='#333', range=[0.9, 1.15]))
                 st.plotly_chart(fig_v, use_container_width=True)
 
 
@@ -1730,6 +1893,8 @@ def render_feeder(view_bus):
             st.session_state.auto_tap_mode = auto_tap
             if auto_tap:
                 st.info(f"AVR ACTIVE: {st.session_state.tap_position:.3f} pu")
+                if avr_status != "IDLE":
+                    st.warning(avr_status)
             else:
                 tap_val = st.slider("TAP POSITION (pu)", 0.90, 1.10, st.session_state.tap_position, step=0.01)
                 st.session_state.tap_position = tap_val
@@ -1797,117 +1962,6 @@ def render_feeder(view_bus):
         st.plotly_chart(make_cyber_plot(list(range(len(hist_data))), hist_data, f"LOAD: {view_bus}", "#00f3ff", delta_val=delta_feeder), use_container_width=True, key="feeder_load_trend")
     with c_phasor:
         st.plotly_chart(draw_phasor(Ia, Id, Ib, Ibd, Ic, Icd), use_container_width=True, key="phasor_diagram")
-
-# --- REAL-TIME TOPOLOGY RENDERER ---
-def get_node_sim_data(bus_name, current_idx):
-    try:
-        p_kw = df_fa_p[bus_name].iloc[current_idx]
-        q_kvar = df_fa_p[bus_name].iloc[current_idx] * 0.4
-    except KeyError:
-        base_load = 50.0
-        if "30" in bus_name: base_load = 80.0
-        p_kw = base_load + (10 * np.sin(current_idx * 0.1)) + np.random.uniform(-2, 2)
-        q_kvar = p_kw * 0.3
-
-    # PV Injection
-    pv_out, _, _ = calculate_pv_physics(bus_name, current_idx, st.session_state.room_temp)
-
-    # Use Physics Engine for Voltage (Reverse Power Flow Aware)
-    v_pu = calculate_voltage_profile(bus_name, p_kw, q_kvar, st.session_state.tap_position, p_gen_kw=pv_out)
-    
-    # Net Power for Current Calc
-    p_net = p_kw - pv_out
-    i_amps = (np.sqrt(p_net**2 + q_kvar**2) / (0.208 * 1.732)) if bus_name not in TRANSFORMER_NODES else 0.0
-    pf = p_net / np.sqrt(p_net**2 + q_kvar**2) if p_net > 0 else 1.0
-    
-    return v_pu, i_amps, p_kw, q_kvar, pf, pv_out
-
-@st.fragment(run_every=speed if st.session_state.run_simulation else None)
-def render_topology():
-    if st.session_state.run_simulation: 
-        st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
-    
-    st.markdown("### 🌐 DIGITAL TWIN TOPOLOGY (SLD)")
-    col_map, col_details = st.columns([3, 1])
-    selected_node = st.selectbox("🎯 SELECT ASSET (Or click on map nodes below)", ["All"] + bus_list, index=0)
-    
-    edge_traces = []
-    x_norm, y_norm = [], []
-    x_heavy, y_heavy = [], []
-    x_crit, y_crit = [], []
-    
-    for i, (b1, b2) in enumerate(EDGE_LIST_RAW):
-        if b1 in bus_dict and b2 in bus_dict:
-            x0, y0 = bus_dict[b1]
-            x1, y1 = bus_dict[b2]
-            load_factor = ((i + st.session_state.idx) % 50) / 50.0 
-            if load_factor > 0.9:
-                x_crit.extend([x0, x1, None]); y_crit.extend([y0, y1, None])
-            elif load_factor > 0.7:
-                x_heavy.extend([x0, x1, None]); y_heavy.extend([y0, y1, None])
-            else:
-                x_norm.extend([x0, x1, None]); y_norm.extend([y0, y1, None])
-
-    edge_traces.append(go.Scatter(x=x_norm, y=y_norm, line=dict(width=1, color='#00f3ff'), hoverinfo='none', mode='lines', name='Normal Load'))
-    edge_traces.append(go.Scatter(x=x_heavy, y=y_heavy, line=dict(width=2, color='#ffae00'), hoverinfo='none', mode='lines', name='Heavy Load'))
-    edge_traces.append(go.Scatter(x=x_crit, y=y_crit, line=dict(width=2, color='#ff0055', dash='dot'), hoverinfo='none', mode='lines', name='Critical'))
-
-    node_x, node_y, node_color, node_size, node_sym, node_text = [], [], [], [], [], []
-    for bus, (bx, by) in bus_dict.items():
-        node_x.append(bx); node_y.append(by)
-        
-        # --- NODE STYLING LOGIC ---
-        if bus in SOLAR_BUS_CONFIG:
-            n_type, col, size, sym = "SOLAR BUS", "#ffff00", 14, "circle-x" # Solar gets Yellow
-        elif bus in TRANSFORMER_NODES: 
-            n_type, col, size, sym = "TRANSFORMER", "#ffae00", 12, "star"
-        elif "source" in bus or bus == "bus1": 
-            n_type, col, size, sym = "SUBSTATION", "#ffffff", 18, "diamond"
-        else: 
-            n_type, col, size, sym = "LOAD BUS", "#00f3ff", 6, "circle"
-            
-        if selected_node != "All":
-            if bus == selected_node: col, size = "#ff00ff", 22
-            else: col = "rgba(0, 243, 255, 0.3)"
-        
-        node_color.append(col); node_size.append(size); node_sym.append(sym)
-        node_text.append(f"<b>{bus.upper()}</b><br>{n_type}")
-
-    node_trace = go.Scatter(x=node_x, y=node_y, mode='markers', text=node_text, hoverinfo='text', marker=dict(symbol=node_sym, color=node_color, size=node_size, line=dict(width=1, color='#000')), name="Assets")
-
-    with col_map:
-        fig = go.Figure(data=edge_traces + [node_trace])
-        fig.update_layout(showlegend=True, legend=dict(x=0, y=1, bgcolor='rgba(0,0,0,0.5)', font=dict(color='white')), hovermode='closest', margin=dict(b=0,l=0,r=0,t=0), xaxis=dict(showgrid=False, zeroline=False, showticklabels=False), yaxis=dict(showgrid=False, zeroline=False, showticklabels=False), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=650, dragmode='pan')
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_details:
-        if selected_node != "All":
-            v, i, p, q, pf, pv_out = get_node_sim_data(selected_node, st.session_state.idx)
-            st.markdown(f"""
-            <div style="background: rgba(20,20,30,0.9); border: 1px solid #00f3ff; padding: 15px; border-radius: 5px;">
-                <h4 style="margin:0; color: #ff00ff;">INSPECTOR</h4>
-                <h2 style="margin:0; color: white;">{selected_node.upper()}</h2>
-                <hr style="border-color: #333;">
-            </div>
-            """, unsafe_allow_html=True)
-            c_d1, c_d2 = st.columns(2)
-            c_d1.metric("VOLTAGE", f"{v:.3f} pu", delta="-1.2%" if v < 0.98 else "OK")
-            c_d2.metric("CURRENT", f"{i:.1f} A")
-            
-            if pv_out > 0:
-                 st.metric("SOLAR GENERATION", f"{pv_out:.1f} kW", delta="Active", delta_color="normal")
-            
-            st.metric("POWER FACTOR", f"{pf:.2f}")
-            fig_mini_phasor = go.Figure()
-            fig_mini_phasor.add_trace(go.Scatterpolar(r=[0, v], theta=[0, 0], mode='lines+markers', line=dict(color='#00f3ff', width=3), name='V'))
-            fig_mini_phasor.add_trace(go.Scatterpolar(r=[0, i/100], theta=[0, -30], mode='lines+markers', line=dict(color='#ffae00', width=3), name='I'))
-            fig_mini_phasor.update_layout(polar=dict(radialaxis=dict(visible=False), angularaxis=dict(visible=False), bgcolor="rgba(0,0,0,0)"), paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=10, r=10, t=20, b=20), height=150, showlegend=False, title=dict(text="LOCAL PHASOR", font=dict(size=10, color="#ccc")))
-            st.plotly_chart(fig_mini_phasor, use_container_width=True)
-            load_pct = min(100, (p/100)*100)
-            st.write(f"**LOAD CAPACITY: {load_pct:.1f}%**")
-            st.progress(int(load_pct)/100)
-        else:
-            st.info("👈 Select a node on the map to view real-time telemetry.")
 
 @st.fragment(run_every=speed if st.session_state.run_simulation else None)
 def render_ai_dashboard():
