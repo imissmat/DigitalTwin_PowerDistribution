@@ -132,6 +132,8 @@ SOLAR_DATA_FILE = "Historical_Data/Solardata.csv"
 PROPHET_MODEL_FILE = "prophet_model.json"
 LSTM_MODEL_FILE = "lstm_model.h5"
 SCALER_FILE = "scaler.pkl"
+SOLAR_MODEL_FILE = "lstm_solar_model.h5"
+SOLAR_SCALER_FILE = "scaler_solar.pkl"
 
 # ELECTRICAL PHYSICS CONSTANTS
 OMEGA = 2 * np.pi * 50
@@ -557,6 +559,9 @@ if "tap_position" not in st.session_state: st.session_state.tap_position = 1.0
 if "auto_tap_mode" not in st.session_state: st.session_state.auto_tap_mode = False
 if "tap_moves_count" not in st.session_state: st.session_state.tap_moves_count = 0
 
+# NEW: MPC Control
+if "mpc_active" not in st.session_state: st.session_state.mpc_active = False
+
 # NEW: Cyber Attack
 if "fdi_attack" not in st.session_state: st.session_state.fdi_attack = False
 
@@ -664,18 +669,23 @@ def prepare_lstm_data(series, lookback=24):
     return np.array(X), np.array(y)
 
 @st.cache_resource(show_spinner=False)
-def load_or_train_models(df_values):
+def load_or_train_models(df_values, is_solar=False):
     split_idx = int(len(df_values) * 0.8)
     train_data = df_values[:split_idx]
     test_data = df_values[split_idx:]
     metrics = {"prophet_rmse": 0, "prophet_mae": 0, "lstm_rmse": 0, "lstm_mae": 0}
     
+    # Filenames based on type
+    p_model_file = "prophet_solar.json" if is_solar else PROPHET_MODEL_FILE
+    l_model_file = SOLAR_MODEL_FILE if is_solar else LSTM_MODEL_FILE
+    s_file = SOLAR_SCALER_FILE if is_solar else SCALER_FILE
+
     prophet_model = None
     forecast_full = None
     if PROPHET_AVAILABLE:
-        if os.path.exists(PROPHET_MODEL_FILE):
+        if os.path.exists(p_model_file):
             try:
-                with open(PROPHET_MODEL_FILE, 'r') as fin:
+                with open(p_model_file, 'r') as fin:
                     prophet_model = model_from_json(fin.read())
             except: pass
         if prophet_model is None:
@@ -684,7 +694,7 @@ def load_or_train_models(df_values):
             df_prophet = pd.DataFrame({'ds': time_list, 'y': df_values})
             prophet_model = Prophet(daily_seasonality=True, yearly_seasonality=False)
             prophet_model.fit(df_prophet)
-            with open(PROPHET_MODEL_FILE, 'w') as fout:
+            with open(p_model_file, 'w') as fout:
                 fout.write(model_to_json(prophet_model))
         base_time = datetime.datetime.now()
         time_list = [base_time + datetime.timedelta(hours=x) for x in range(len(df_values))]
@@ -699,10 +709,10 @@ def load_or_train_models(df_values):
     lstm_model = None
     lstm_predictions = None
     if LSTM_AVAILABLE:
-        if os.path.exists(LSTM_MODEL_FILE) and os.path.exists(SCALER_FILE):
+        if os.path.exists(l_model_file) and os.path.exists(s_file):
             try:
-                lstm_model = load_model(LSTM_MODEL_FILE)
-                scaler = joblib.load(SCALER_FILE)
+                lstm_model = load_model(l_model_file)
+                scaler = joblib.load(s_file)
             except: pass
         if lstm_model is None:
             scaler = MinMaxScaler(feature_range=(0, 1))
@@ -714,8 +724,13 @@ def load_or_train_models(df_values):
             lstm_model.add(Dense(1))
             lstm_model.compile(optimizer='adam', loss='mean_squared_error')
             lstm_model.fit(X, y, epochs=5, batch_size=32, verbose=0)
-            lstm_model.save(LSTM_MODEL_FILE)
-            joblib.dump(scaler, SCALER_FILE)
+            lstm_model.save(l_model_file)
+            joblib.dump(scaler, s_file)
+        else:
+             # Just load scaler if model exists
+             if os.path.exists(s_file): scaler = joblib.load(s_file)
+             else: scaler = MinMaxScaler(feature_range=(0,1)); scaler.fit(df_values.reshape(-1,1))
+
         scaled_full = scaler.transform(df_values.reshape(-1, 1))
         X_full, _ = prepare_lstm_data(scaled_full, lookback=24)
         X_full = np.reshape(X_full, (X_full.shape[0], X_full.shape[1], 1))
@@ -1098,6 +1113,67 @@ def get_node_sim_data(bus_name, current_idx):
     
     return v_pu, i_amps, p_kw, q_kvar, pf, pv_out
 
+# ----------------------------------------------------------
+# MPC CONTROLLER (HEURISTIC SOLVER)
+# ----------------------------------------------------------
+def run_mpc_optimization(current_idx, current_load, current_tap, horizon=6):
+    """
+    Receding Horizon Control to optimize tap position
+    Cost J = (V_target - V_pred)^2 + Penalty(Tap_Change)
+    """
+    best_tap = current_tap
+    min_cost = float('inf')
+    
+    # Heuristic Search Space (Limit moves to +/- 1 step or hold)
+    possible_moves = [-0.01, 0.0, 0.01] 
+    
+    # Future Load & Solar Estimation (Simple Lookahead)
+    future_loads = []
+    for h in range(horizon):
+        try:
+            future_loads.append(df_raw["Total_Active_Power"].iloc[(current_idx + h) % len(df_raw)])
+        except:
+            future_loads.append(5000.0)
+            
+    # Solar forecast (Simple lookahead from profile)
+    future_solar = []
+    for h in range(horizon):
+        future_solar.append(get_solar_contribution(current_idx + h))
+
+    # Evaluate each move
+    for move in possible_moves:
+        test_tap = current_tap + move
+        if not (0.90 <= test_tap <= 1.10): continue # Bounds check
+        
+        cost = 0.0
+        # Receding Horizon Simulation
+        for h in range(horizon):
+            # Estimate Net Load
+            # Assume 50% penetration for MPC calc context
+            total_gen_est = future_solar[h] * (len(POTENTIAL_SOLAR_SITES) * 0.5 * 20.0) 
+            net_load_est = future_loads[h] - total_gen_est
+            
+            # Predict Voltage ( Simplified V ~ Tap - Drop)
+            # Drop proportional to load
+            v_drop_est = net_load_est / 150000.0
+            v_pred = test_tap - v_drop_est
+            
+            # Cost Function
+            # 1. Voltage Deviation from 1.0
+            cost += 1000 * (1.0 - v_pred)**2
+            
+            # 2. Penalty for Step Change (Control Effort)
+            if move != 0: cost += 5.0
+            
+            # 3. Soft Constraint Violation
+            if v_pred > 1.05 or v_pred < 0.95: cost += 5000.0
+            
+        if cost < min_cost:
+            min_cost = cost
+            best_tap = test_tap
+            
+    return best_tap
+
 # --- CYBERPUNK PLOTTING FUNCTIONS ---
 def make_cyber_meter(value, delta_val, title, min_val, max_val, color_hex):
     fig = go.Figure(go.Indicator(
@@ -1278,6 +1354,12 @@ with st.sidebar:
         if cloud != st.session_state.cloud_shading:
              log_event("Environment", "Weather", "Cloud Front Detected" if cloud else "Clear Sky")
         st.session_state.cloud_shading = cloud
+        
+        # --- MPC TOGGLE ---
+        mpc_mode = st.toggle("🤖 ACTIVATE MPC AGENT", value=st.session_state.mpc_active, help="Model Predictive Control: AI Agent takes over Tap Changer.")
+        if mpc_mode != st.session_state.mpc_active:
+             log_event("Control", "Mode Change", "MPC Agent Active" if mpc_mode else "Manual/Rule Control")
+        st.session_state.mpc_active = mpc_mode
         
         if st.button("RESTART", use_container_width=True):
             st.session_state.idx = 0
@@ -1552,7 +1634,19 @@ def render_home():
     
     # Plots
     gp1, gp2, gp3 = st.columns(3)
-    with gp1: st.plotly_chart(make_cyber_plot(list(range(len(st.session_state.global_v_history))), st.session_state.global_v_history, "GRID VOLTAGE PROFILE (Avg)", "#00f3ff", height=150), use_container_width=True)
+    with gp1: 
+        # BEAUTIFIED VOLTAGE PLOT WITH LIMITS
+        fig_v = make_cyber_plot(list(range(len(st.session_state.global_v_history))), st.session_state.global_v_history, "GRID VOLTAGE PROFILE (Avg)", "#00f3ff", height=150)
+        # Add Limit Lines
+        fig_v.add_hline(y=1.05, line_width=2, line_dash="dash", line_color="red")
+        fig_v.add_hline(y=0.95, line_width=2, line_dash="dash", line_color="red")
+        # Add Safe Zone Band
+        fig_v.add_hrect(y0=0.95, y1=1.05, line_width=0, fillcolor="green", opacity=0.1)
+        # Add Danger Zones
+        fig_v.add_hrect(y0=1.05, y1=1.2, line_width=0, fillcolor="red", opacity=0.1)
+        fig_v.add_hrect(y0=0.8, y1=0.95, line_width=0, fillcolor="red", opacity=0.1)
+        st.plotly_chart(fig_v, use_container_width=True)
+        
     with gp2: st.plotly_chart(make_cyber_plot(list(range(len(st.session_state.global_pf_history))), st.session_state.global_pf_history, "GRID POWER FACTOR", "#ffae00", height=150), use_container_width=True)
     with gp3: st.plotly_chart(make_cyber_plot(list(range(len(st.session_state.global_j_history))), st.session_state.global_j_history, "GLOBAL SE RESIDUAL (J)", "#ff0055", height=150), use_container_width=True)
 
@@ -1607,20 +1701,32 @@ def render_feeder(view_bus):
     # Final Voltage with Smart Inverter Actions (Includes Reverse Flow Logic)
     voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
     
-    # --- FIXED: IMPROVED AUTO-TAP CHANGER LOGIC (AVR) ---
+    # --- UPDATED: MPC AGENT INTEGRATION ---
     avr_status = "IDLE"
-    if st.session_state.auto_tap_mode and not st.session_state.relay_trip:
+    
+    # If MPC is ACTIVE, it overrides the Auto-Tap logic
+    if st.session_state.mpc_active and not st.session_state.relay_trip:
+        # Run the MPC Solver
+        optimized_tap = run_mpc_optimization(idx, display_p, st.session_state.tap_position)
+        
+        # Apply the optimized tap
+        if optimized_tap != st.session_state.tap_position:
+            st.session_state.tap_position = optimized_tap
+            st.session_state.tap_moves_count += 1
+            avr_status = "🤖 MPC OPTIMIZING..."
+            # Re-Calculate Voltage IMMEDIATELY
+            voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
+            
+    elif st.session_state.auto_tap_mode and not st.session_state.relay_trip:
+        # Standard Rule-Based Logic
         did_tap_change = False
         step_change = 0.005 # 0.5% Step
         
-        # Upper Limit Check (Reduce Voltage)
         if voltage_pu_phys > 1.04: 
             if st.session_state.tap_position > 0.90:
                 st.session_state.tap_position -= step_change
                 did_tap_change = True
                 avr_status = "LOWERING TAPS 🔻"
-        
-        # Lower Limit Check (Boost Voltage)
         elif voltage_pu_phys < 0.96:
             if st.session_state.tap_position < 1.10:
                 st.session_state.tap_position += step_change
@@ -1628,11 +1734,8 @@ def render_feeder(view_bus):
                 avr_status = "RAISING TAPS 🔺"
         
         if did_tap_change:
-            # Teacher Requirement: Count Operations (Stress)
             st.session_state.tap_moves_count += 1
-            # Re-Calculate Voltage IMMEDIATELY so UI updates instantly
             voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
-            
             if st.session_state.tap_moves_count % 10 == 0:
                  log_event("Equipment", "Stress", f"High Tap Frequency: {st.session_state.tap_moves_count} ops")
     # ----------------------------------------------------
@@ -1964,6 +2067,98 @@ def render_feeder(view_bus):
         st.plotly_chart(draw_phasor(Ia, Id, Ib, Ibd, Ic, Icd), use_container_width=True, key="phasor_diagram")
 
 @st.fragment(run_every=speed if st.session_state.run_simulation else None)
+def render_topology():
+    if st.session_state.run_simulation: 
+        st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
+    
+    st.markdown("### 🌐 DIGITAL TWIN TOPOLOGY (SLD)")
+    col_map, col_details = st.columns([3, 1])
+    selected_node = st.selectbox("🎯 SELECT ASSET (Or click on map nodes below)", ["All"] + bus_list, index=0)
+    
+    edge_traces = []
+    x_norm, y_norm = [], []
+    x_heavy, y_heavy = [], []
+    x_crit, y_crit = [], []
+    
+    for i, (b1, b2) in enumerate(EDGE_LIST_RAW):
+        if b1 in bus_dict and b2 in bus_dict:
+            x0, y0 = bus_dict[b1]
+            x1, y1 = bus_dict[b2]
+            load_factor = ((i + st.session_state.idx) % 50) / 50.0 
+            if load_factor > 0.9:
+                x_crit.extend([x0, x1, None]); y_crit.extend([y0, y1, None])
+            elif load_factor > 0.7:
+                x_heavy.extend([x0, x1, None]); y_heavy.extend([y0, y1, None])
+            else:
+                x_norm.extend([x0, x1, None]); y_norm.extend([y0, y1, None])
+
+    edge_traces.append(go.Scatter(x=x_norm, y=y_norm, line=dict(width=1, color='#00f3ff'), hoverinfo='none', mode='lines', name='Normal Load'))
+    edge_traces.append(go.Scatter(x=x_heavy, y=y_heavy, line=dict(width=2, color='#ffae00'), hoverinfo='none', mode='lines', name='Heavy Load'))
+    edge_traces.append(go.Scatter(x=x_crit, y=y_crit, line=dict(width=2, color='#ff0055', dash='dot'), hoverinfo='none', mode='lines', name='Critical'))
+
+    node_x, node_y, node_color, node_size, node_sym, node_text = [], [], [], [], [], []
+    
+    # Calculate active solar count for topology visualization
+    active_count = int(len(POTENTIAL_SOLAR_SITES) * st.session_state.spatial_penetration_pct / 100.0)
+    active_solar_list = POTENTIAL_SOLAR_SITES[:active_count]
+
+    for bus, (bx, by) in bus_dict.items():
+        node_x.append(bx); node_y.append(by)
+        
+        # --- DYNAMIC NODE STYLING LOGIC ---
+        if bus in active_solar_list:
+            n_type, col, size, sym = "ACTIVE SOLAR", "#ffff00", 14, "circle-x" # Yellow for Solar
+        elif bus in TRANSFORMER_NODES: 
+            n_type, col, size, sym = "TRANSFORMER", "#ffae00", 12, "star"
+        elif "source" in bus or bus == "bus1": 
+            n_type, col, size, sym = "SUBSTATION", "#ffffff", 18, "diamond"
+        else: 
+            n_type, col, size, sym = "LOAD BUS", "#00f3ff", 6, "circle"
+            
+        if selected_node != "All":
+            if bus == selected_node: col, size = "#ff00ff", 22
+            else: col = "rgba(0, 243, 255, 0.3)"
+        
+        node_color.append(col); node_size.append(size); node_sym.append(sym)
+        node_text.append(f"<b>{bus.upper()}</b><br>{n_type}")
+
+    node_trace = go.Scatter(x=node_x, y=node_y, mode='markers', text=node_text, hoverinfo='text', marker=dict(symbol=node_sym, color=node_color, size=node_size, line=dict(width=1, color='#000')), name="Assets")
+
+    with col_map:
+        fig = go.Figure(data=edge_traces + [node_trace])
+        fig.update_layout(showlegend=True, legend=dict(x=0, y=1, bgcolor='rgba(0,0,0,0.5)', font=dict(color='white')), hovermode='closest', margin=dict(b=0,l=0,r=0,t=0), xaxis=dict(showgrid=False, zeroline=False, showticklabels=False), yaxis=dict(showgrid=False, zeroline=False, showticklabels=False), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=650, dragmode='pan')
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_details:
+        if selected_node != "All":
+            v, i, p, q, pf, pv_out = get_node_sim_data(selected_node, st.session_state.idx)
+            st.markdown(f"""
+            <div style="background: rgba(20,20,30,0.9); border: 1px solid #00f3ff; padding: 15px; border-radius: 5px;">
+                <h4 style="margin:0; color: #ff00ff;">INSPECTOR</h4>
+                <h2 style="margin:0; color: white;">{selected_node.upper()}</h2>
+                <hr style="border-color: #333;">
+            </div>
+            """, unsafe_allow_html=True)
+            c_d1, c_d2 = st.columns(2)
+            c_d1.metric("VOLTAGE", f"{v:.3f} pu", delta="-1.2%" if v < 0.98 else "OK")
+            c_d2.metric("CURRENT", f"{i:.1f} A")
+            
+            if pv_out > 0:
+                 st.metric("SOLAR GENERATION", f"{pv_out:.1f} kW", delta="Active", delta_color="normal")
+            
+            st.metric("POWER FACTOR", f"{pf:.2f}")
+            fig_mini_phasor = go.Figure()
+            fig_mini_phasor.add_trace(go.Scatterpolar(r=[0, v], theta=[0, 0], mode='lines+markers', line=dict(color='#00f3ff', width=3), name='V'))
+            fig_mini_phasor.add_trace(go.Scatterpolar(r=[0, i/100], theta=[0, -30], mode='lines+markers', line=dict(color='#ffae00', width=3), name='I'))
+            fig_mini_phasor.update_layout(polar=dict(radialaxis=dict(visible=False), angularaxis=dict(visible=False), bgcolor="rgba(0,0,0,0)"), paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=10, r=10, t=20, b=20), height=150, showlegend=False, title=dict(text="LOCAL PHASOR", font=dict(size=10, color="#ccc")))
+            st.plotly_chart(fig_mini_phasor, use_container_width=True)
+            load_pct = min(100, (p/100)*100)
+            st.write(f"**LOAD CAPACITY: {load_pct:.1f}%**")
+            st.progress(int(load_pct)/100)
+        else:
+            st.info("👈 Select a node on the map to view real-time telemetry.")
+
+@st.fragment(run_every=speed if st.session_state.run_simulation else None)
 def render_ai_dashboard():
     if st.session_state.run_simulation: 
         st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
@@ -1973,56 +2168,82 @@ def render_ai_dashboard():
     else:
         sim_idx = st.session_state.idx
         with st.spinner("AI ENGINE: Loading Cached Models or Training..."):
-            m_prophet, full_fcast, m_lstm, lstm_preds, metrics = load_or_train_models(df_raw["Total_Active_Power"].values)
+            # Load Forecasting
+            m_prophet, full_fcast, m_lstm, lstm_preds, metrics = load_or_train_models(df_raw["Total_Active_Power"].values, is_solar=False)
+            
+            # NEW: Solar Generation Forecasting
+            # Use 'solar_profile' from start of script (assumed to be populated)
+            # If not populated, fallback to zeros
+            solar_vals = solar_profile if solar_profile is not None else np.zeros(len(df_raw))
+            # Scale up to kW for better visualization (e.g. max capacity 5000kW system wide)
+            solar_vals_kw = solar_vals * 5000.0 
+            _, full_solar_fcast, _, lstm_solar_preds, solar_metrics = load_or_train_models(solar_vals_kw, is_solar=True)
         
         start_hist = max(0, sim_idx - 72)
         end_hist = sim_idx
         start_pred = sim_idx
         end_pred = min(len(full_fcast), sim_idx + 24)
         
+        # --- LOAD DATA PREP ---
         hist_dates = full_fcast['ds'].iloc[start_hist:end_hist]
         hist_actual = df_raw["Total_Active_Power"].iloc[start_hist:end_hist].values
-        
         pred_dates = full_fcast['ds'].iloc[start_pred:end_pred]
         prophet_slice = full_fcast['yhat'].iloc[start_pred:end_pred]
         lstm_slice = lstm_preds[start_pred:end_pred] if lstm_preds is not None else []
         
-        hist_prophet = full_fcast['yhat'].iloc[start_hist:end_hist].values
-        hist_lstm = lstm_preds[start_hist:end_hist]
-        
-        if len(hist_actual) > 0:
-            p_rmse = np.sqrt(mean_squared_error(hist_actual, hist_prophet))
-            p_mae = mean_absolute_error(hist_actual, hist_prophet)
-            l_rmse = np.sqrt(mean_squared_error(hist_actual, hist_lstm))
-            l_mae = mean_absolute_error(hist_actual, hist_lstm)
-        else:
-            p_rmse, p_mae, l_rmse, l_mae = 0.0, 0.0, 0.0, 0.0
+        # --- SOLAR DATA PREP ---
+        hist_solar_actual = solar_vals_kw[start_hist:end_hist]
+        prophet_solar_slice = full_solar_fcast['yhat'].iloc[start_pred:end_pred]
+        lstm_solar_slice = lstm_solar_preds[start_pred:end_pred] if lstm_solar_preds is not None else []
 
         st.markdown("### 🏆 MODEL PERFORMANCE COMPARISON (LIVE ROLLING WINDOW)")
-        cm1, cm2, cm3, cm4 = st.columns(4)
         
-        with cm1: st.metric("PROPHET RMSE", f"{p_rmse:.2f}")
-        with cm2: st.metric("PROPHET MAE", f"{p_mae:.2f}")
-        with cm3: 
-            delta_rmse = p_rmse - l_rmse
-            st.metric("LSTM RMSE (Deep Learning)", f"{l_rmse:.2f}", delta=f"{-delta_rmse:.2f} (Better)", delta_color="inverse")
-        with cm4: 
-            delta_mae = p_mae - l_mae
-            st.metric("LSTM MAE (Deep Learning)", f"{l_mae:.2f}", delta=f"{-delta_mae:.2f} (Better)", delta_color="inverse")
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist_dates, y=hist_actual, name="ACTUAL (History)", line=dict(color='#00f3ff', width=2)))
-        fig.add_trace(go.Scatter(x=pred_dates, y=prophet_slice, name="PROPHET (Baseline)", line=dict(color='#ffff00', width=2, dash='dot')))
-        fig.add_trace(go.Scatter(x=pred_dates, y=lstm_slice, name="LSTM (Deep Learning)", line=dict(color='#ff00ff', width=4)))
+        # METRICS CALCULATIONS
+        if len(lstm_slice) > 0:
+            pred_peak_load = np.max(lstm_slice)
+            pred_avg_load = np.mean(lstm_slice)
+            pred_min_load = np.min(lstm_slice)
+        else:
+            pred_peak_load, pred_avg_load, pred_min_load = 0, 0, 0
+            
+        if len(lstm_solar_slice) > 0:
+            pred_peak_solar = np.max(lstm_solar_slice)
+            pred_avg_solar = np.mean(lstm_solar_slice)
+            pred_min_solar = np.min(lstm_solar_slice)
+        else:
+            pred_peak_solar, pred_avg_solar, pred_min_solar = 0, 0, 0
 
-        fig.update_layout(
-            title=f"REAL-TIME FORECAST COMPARISON (Sim Hour: {sim_idx})", 
-            xaxis_title="TIME", yaxis_title="Active Power (kW)",
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.3)',
-            font=dict(color="#ccc", family="Orbitron"), height=500, 
-            xaxis=dict(gridcolor="#333"), yaxis=dict(gridcolor="#333")
-        )
-        st.plotly_chart(fig, use_container_width=True, key="hybrid_forecast")
+        # DISPLAY METRICS
+        cm1, cm2, cm3 = st.columns(3)
+        with cm1: st.metric("PREDICTED PEAK DEMAND (24h)", f"{pred_peak_load:.1f} kW", delta="Max Load")
+        with cm2: st.metric("PREDICTED AVG DEMAND (24h)", f"{pred_avg_load:.1f} kW", delta="Baseload")
+        with cm3: st.metric("PREDICTED MIN DEMAND (24h)", f"{pred_min_load:.1f} kW", delta="Trough")
+        
+        sm1, sm2, sm3 = st.columns(3)
+        with sm1: st.metric("PREDICTED PEAK SOLAR (24h)", f"{pred_peak_solar:.1f} kW", delta="Max Gen", delta_color="inverse")
+        with sm2: st.metric("PREDICTED AVG SOLAR (24h)", f"{pred_avg_solar:.1f} kW", delta="Mean Gen", delta_color="inverse")
+        with sm3: st.metric("PREDICTED MIN SOLAR (24h)", f"{pred_min_solar:.1f} kW", delta="Night", delta_color="inverse")
+
+        # PLOTS
+        tab1, tab2 = st.tabs(["LOAD FORECAST", "SOLAR GENERATION FORECAST"])
+        
+        with tab1:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=hist_dates, y=hist_actual, name="ACTUAL (History)", line=dict(color='#00f3ff', width=2)))
+            fig.add_trace(go.Scatter(x=pred_dates, y=prophet_slice, name="PROPHET (Baseline)", line=dict(color='#ffff00', width=2, dash='dot')))
+            fig.add_trace(go.Scatter(x=pred_dates, y=lstm_slice, name="LSTM (Deep Learning)", line=dict(color='#ff00ff', width=4)))
+            fig.update_layout(title=f"LOAD FORECAST (Sim Hour: {sim_idx})", xaxis_title="TIME", yaxis_title="Active Power (kW)", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.3)', font=dict(color="#ccc", family="Orbitron"), height=400, xaxis=dict(gridcolor="#333"), yaxis=dict(gridcolor="#333"))
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with tab2:
+            fig_s = go.Figure()
+            # FIX: Moved 'fill' to go.Scatter argument
+            fig_s.add_trace(go.Scatter(x=hist_dates, y=hist_solar_actual, name="ACTUAL (History)", fill='tozeroy', line=dict(color='#00ff00', width=2)))
+            fig_s.add_trace(go.Scatter(x=pred_dates, y=prophet_solar_slice, name="PROPHET (Baseline)", line=dict(color='#ffff00', width=2, dash='dot')))
+            fig_s.add_trace(go.Scatter(x=pred_dates, y=lstm_solar_slice, name="LSTM (Deep Learning)", line=dict(color='#ff00ff', width=4)))
+            fig_s.update_layout(title=f"SOLAR GENERATION FORECAST (Sim Hour: {sim_idx})", xaxis_title="TIME", yaxis_title="Solar Power (kW)", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.3)', font=dict(color="#ccc", family="Orbitron"), height=400, xaxis=dict(gridcolor="#333"), yaxis=dict(gridcolor="#333"))
+            st.plotly_chart(fig_s, use_container_width=True)
+
         st.info("ℹ️ NOTE: The LSTM model is trained once and cached. If you delete 'lstm_model.h5', it will retrain automatically.")
 
 # ----------------------------------------------------------
