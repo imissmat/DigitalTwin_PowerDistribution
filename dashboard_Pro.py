@@ -148,7 +148,8 @@ TRANSFORMER_TAU = 20.0
 SOURCE_IMPEDANCE = 0.05 + 0.1j  
 
 # *** WEAK GRID PHYSICS: High Impedance to allow Voltage Instability ***
-LINE_IMPEDANCE_PER_UNIT_DIST = 0.045 + 0.045j 
+LINE_IMPEDANCE_PER_UNIT_DIST = 0.05 + 0.05j 
+VOLTAGE_SENSITIVITY_CONST = 75000.0
 
 # SWING EQUATION CONSTANTS
 INERTIA_H = 5.0 
@@ -164,8 +165,75 @@ FAULT_LIBRARY = {
 }
 
 # --- BESS (BATTERY) CONFIGURATION ---
-BESS_CAPACITY_KWH = 500.0
-BESS_MAX_POWER = 100.0 
+BESS_CAPACITY_KWH = 10000.0 
+BESS_MAX_POWER = 3000.0     
+
+#====MASTER TICK FUNCTION==============
+#======================================
+
+def advance_simulation_step():
+    """
+    Advances the global system state by one time step.
+    This runs physics for the WHOLE grid, regardless of what view is open.
+    """
+    if not st.session_state.run_simulation:
+        return
+
+    # 1. Advance Time
+    st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
+    idx = st.session_state.idx
+    row = df_raw.iloc[idx]
+
+    # 2. Global Load & Solar Calculation
+    p_load_total = row["Total_Active_Power"] + st.session_state.hvac_load_kw
+    
+    total_pv_gen = 0.0
+    for bus_name in POTENTIAL_SOLAR_SITES:
+        p_val, _, _ = calculate_pv_physics(
+            bus_name, idx, st.session_state.room_temp, 
+            st.session_state.spatial_penetration_pct, 
+            st.session_state.mpc_curtailment
+        )
+        total_pv_gen += p_val
+
+    # --- NEW: RUN MPC AI GLOBALLY ---
+    if st.session_state.mpc_active and not st.session_state.relay_trip:
+        opt_tap, opt_bess, opt_curt = run_mpc_optimization(
+            idx, p_load_total, st.session_state.tap_position, st.session_state.bess_soc
+        )
+        if opt_tap != st.session_state.tap_position:
+            st.session_state.tap_position = opt_tap
+            st.session_state.tap_moves_count += 1
+        st.session_state.mpc_bess_power_cmd = opt_bess
+        st.session_state.mpc_curtailment = opt_curt
+    elif not st.session_state.mpc_active:
+        st.session_state.mpc_curtailment = 0.0 # Reset if AI is disabled
+
+    # 3. BESS Logic (Runs after MPC to catch immediate commands)
+    p_bess, bess_mode = bess_dispatch_logic(p_load_total - total_pv_gen, idx)
+    
+    if st.session_state.bess_active and p_bess != 0:
+        energy_kwh = p_bess * 1.0 
+        delta_soc = -(energy_kwh / BESS_CAPACITY_KWH) * 100
+        st.session_state.bess_soc = max(0.0, min(100.0, st.session_state.bess_soc + delta_soc))
+
+    # 4. Global Grid Physics (Frequency, Inertia)
+    p_grid_net = p_load_total - total_pv_gen - p_bess
+    q_val = row["Total_Reac_Power"] + (st.session_state.hvac_load_kw * 0.6)
+    
+    recloser_logic() 
+    freq, temp = update_grid_physics(p_grid_net, q_val)
+    
+    st.session_state.prev_p = p_grid_net
+    st.session_state.prev_q = q_val
+    
+    # 5. Update Global History Buffers
+    g_avg_voltage = st.session_state.tap_position - (p_grid_net / VOLTAGE_SENSITIVITY_CONST)
+    
+    st.session_state.global_v_history.append(g_avg_voltage)
+    st.session_state.global_pf_history.append(0.95) 
+    st.session_state.global_j_history.append(0.02) 
+
 
 # ----------------------------------------------------------
 # 3. TOPOLOGY & DATA PARSING
@@ -561,6 +629,8 @@ if "tap_moves_count" not in st.session_state: st.session_state.tap_moves_count =
 
 # NEW: MPC Control
 if "mpc_active" not in st.session_state: st.session_state.mpc_active = False
+if "mpc_bess_power_cmd" not in st.session_state: st.session_state.mpc_bess_power_cmd = 0.0
+if "mpc_curtailment" not in st.session_state: st.session_state.mpc_curtailment = 0.0 # NEW: Solar Cut%
 
 # NEW: Cyber Attack
 if "fdi_attack" not in st.session_state: st.session_state.fdi_attack = False
@@ -568,10 +638,14 @@ if "fdi_attack" not in st.session_state: st.session_state.fdi_attack = False
 # NEW: Cloud Shading & BESS
 if "cloud_shading" not in st.session_state: st.session_state.cloud_shading = False
 if "bess_soc" not in st.session_state: st.session_state.bess_soc = 50.0 
+if "bess_active" not in st.session_state: st.session_state.bess_active = False
 
 # NEW: SPATIAL PENETRATION LEVEL (0-100%)
 if "spatial_penetration_pct" not in st.session_state: st.session_state.spatial_penetration_pct = 10
 if "enable_smart_inverter" not in st.session_state: st.session_state.enable_smart_inverter = False
+
+# NEW: CURTAILMENT TRACKER
+if "curtailment_kw" not in st.session_state: st.session_state.curtailment_kw = 0.0
 
 if "room_temp" not in st.session_state: st.session_state.room_temp = 28.0
 if "hvac_on" not in st.session_state: st.session_state.hvac_on = False
@@ -633,16 +707,35 @@ def load_data(path):
 
 @st.cache_data
 def load_solar_profile():
+    # Try to load real data
     try:
-        df = pd.read_csv(SOLAR_DATA_FILE)
-        # Normalize the first column to use as a 0-1 generation profile
-        vals = df.iloc[:, 0].values
-        max_val = np.max(vals)
-        if max_val > 0:
-            return vals / max_val
-        return vals 
+        if os.path.exists(SOLAR_DATA_FILE):
+            df = pd.read_csv(SOLAR_DATA_FILE)
+            vals = df.iloc[:, 0].values
+            max_val = np.max(vals)
+            if max_val > 0:
+                return vals / max_val
     except:
-        return None
+        pass
+        
+    # FALLBACK: Generate Synthetic Solar Profile if file missing or invalid
+    # 8760 hours of a bell curve pattern
+    hours = np.arange(8760)
+    day_cycle = hours % 24
+    
+    # Peak at noon (12), zero at night (before 6, after 18)
+    # Simple curve: sin((h-6) * pi/12)
+    solar_synth = []
+    for h in day_cycle:
+        if 6 <= h <= 18:
+            val = np.sin((h - 6) * np.pi / 12)
+            # Add some random cloud noise
+            noise = np.random.uniform(0.8, 1.0)
+            solar_synth.append(max(0.0, val * noise))
+        else:
+            solar_synth.append(0.0)
+            
+    return np.array(solar_synth)
 
 df_raw = load_data(CSV_PATH)
 df_fa_p = load_data(FEEDER_A_P)
@@ -793,35 +886,40 @@ def convert_seq_to_phase(I0, I1, I2):
 
 def calculate_voltage_profile(bus_name, p_load_kw, q_load_kvar, tap_pos, p_gen_kw=0.0, q_gen_kvar=0.0):
     """
-    Enhanced Physics: Calculates Voltage Drop considering Load and Generation.
-    Now includes REVERSE POWER FLOW logic causing VOLTAGE RISE.
+    AGGRESSIVE PHYSICS: Calculates Voltage Drop/Rise with high sensitivity.
     """
+    # 1. Get Distance (simulate long feeders)
     dist = dist_map.get(bus_name, 1.0)
-    if dist < 1e-6: dist = 1e-6 
+    if dist < 0.1: dist = 0.5 # Minimum distance to ensure impedance
     
-    # Net Power at Bus (Load - Generation)
-    # If p_gen > p_load, p_net is negative, meaning power flows TO source
+    # 2. Net Power (Generation is NEGATIVE load)
     p_net = p_load_kw - p_gen_kw
-    
-    # Net Reactive Power (Load - Inverter Injection)
     q_net = q_load_kvar - q_gen_kvar
     
-    z_line = LINE_IMPEDANCE_PER_UNIT_DIST * dist
-    v_source = 1.0 * tap_pos
+    # 3. Weak Grid Impedance Calculation
+    # Z_total = (Unit_Z * Distance) + Source_Z
+    r_line = LINE_IMPEDANCE_PER_UNIT_DIST.real * dist
+    x_line = LINE_IMPEDANCE_PER_UNIT_DIST.imag * dist
     
-    # Complex Power S = P + jQ
-    s_apparent_net = complex(p_net, q_net) / 1000.0
+    # 4. Voltage Drop Approximation (The "K-Factor" Approach)
+    # V_drop ~= (P*R + Q*X) / V_base
+    # If P is negative (Solar > Load), this term becomes negative -> Voltage RISE.
     
-    # I = (S/V)*
-    # If P is negative (Reverse Flow), Current angle shifts 180 deg
-    i_approx = s_apparent_net.conjugate() / v_source
+    v_base = 400.0 # 400V Base for LV side
+    # Scale P and Q to roughly align with PU system (Assuming 1.0 pu = 400V)
     
-    # V_load = V_source - (I * Z)
-    # If I is negative (flowing back), this subtracts a negative, resulting in ADDITION (Voltage Rise)
-    v_drop = i_approx * z_line
-    v_load = v_source - v_drop
+    # Heuristic Sensitivity:
+    # We want 3000kW reverse flow to cause ~0.08 pu rise at end of line.
+    voltage_deviation = (p_net * r_line + q_net * x_line) / VOLTAGE_SENSITIVITY_CONST
     
-    return abs(v_load)
+    # 5. Tap Changer Effect
+    # The tap position directly scales the source voltage.
+    v_source = tap_pos
+    
+    # Final V = Source - Drop (or Source + Rise)
+    v_final = v_source - voltage_deviation
+    
+    return abs(v_final)
 
 def update_grid_physics(current_p, current_q):
     """2ND ORDER SWING EQUATION + GOVERNOR CONTROL"""
@@ -1018,22 +1116,19 @@ def get_solar_contribution(idx):
         elif 15 <= h < 19: return 1.0 - (0.25 * (h - 15))
         return 0.0
 
-def calculate_pv_physics(bus_name, idx, ambient_temp, penetration_multiplier=1.0):
+def calculate_pv_physics(bus_name, idx, ambient_temp, penetration_multiplier=1.0, curtailment_factor=0.0):
     """
     Mathematically rigorous PV calculation.
-    Now accepts 'penetration_multiplier' to simulate INSTABILITY.
-    Returns: P_gen (kW), Cell_Temp (C), Irradiance (0-1)
+    Now accepts 'curtailment_factor' (0.0 to 1.0) to proactively cut power.
     """
-    # *** MOVED GLOBAL HELPER FUNCTION FOR TOPOLOGY RENDERER ***
     # Determine the subset of active buses based on slider
-    # Note: 'penetration_multiplier' is used here as 'spatial_penetration_pct'
     count_active = int(len(POTENTIAL_SOLAR_SITES) * penetration_multiplier / 100.0)
     active_buses = POTENTIAL_SOLAR_SITES[:count_active]
     
     if bus_name not in active_buses:
         return 0.0, ambient_temp, 0.0
     
-    # If active, get its assigned capacity (Residential or Commercial)
+    # If active, get its assigned capacity
     capacity = SOLAR_SITE_CAPACITY.get(bus_name, 10.0)
     
     irradiance = get_solar_contribution(idx) # "Suns"
@@ -1052,8 +1147,11 @@ def calculate_pv_physics(bus_name, idx, ambient_temp, penetration_multiplier=1.0
     p_gen_ideal = capacity * irradiance
     p_gen_real = p_gen_ideal * temp_loss_factor
     
+    # Apply Active Curtailment (MPC Command)
+    p_gen_final = p_gen_real * (1.0 - curtailment_factor)
+    
     noise = np.random.uniform(0.98, 1.02)
-    return p_gen_real * noise, t_cell, irradiance
+    return p_gen_final * noise, t_cell, irradiance
 
 def smart_inverter_logic(v_pu, p_available_kw, capacity_kw):
     """
@@ -1084,12 +1182,53 @@ def smart_inverter_logic(v_pu, p_available_kw, capacity_kw):
     return p_out, q_out, ", ".join(status)
 
 def bess_dispatch_logic(net_load_kw, current_hour):
-    """
-    BESS LOGIC DISABLED PER INSTRUCTIONS
-    """
-    return 0.0, "DISABLED (Solar Only Mode)"
+    if not st.session_state.bess_active:
+        return 0.0, "OFFLINE"
+    
+    # --- MPC OVERRIDE ---
+    if st.session_state.mpc_active:
+        cmd = st.session_state.mpc_bess_power_cmd
+        soc = st.session_state.bess_soc
+        if cmd < 0 and soc >= 98.0: cmd = 0.0 # Safety top-off
+        if cmd > 0 and soc <= 5.0: cmd = 0.0  # Safety bottom-out
+        
+        status = "MPC CONTROL"
+        if cmd < -1.0: status = "MPC CHARGING"
+        elif cmd > 1.0: status = "MPC DISCHARGING"
+        return cmd, status
 
-# --- HELPER FUNCTION FOR TOPOLOGY RENDERING (MOVED HERE TO FIX NAME ERROR) ---
+    # --- IMPROVED RULE BASED LOGIC ---
+    soc = st.session_state.bess_soc
+    p_cmd = 0.0
+    status = "IDLE"
+    
+    # Dynamic Thresholds (Assumes 5000kW is "Average")
+    PEAK_THRESHOLD = 5200.0 
+    EXCESS_SOLAR_THRESHOLD = 2000.0 # If load drops below this, we likely have high solar
+    
+    # 1. Charging Logic (Solar Soak)
+    # Charge if net load is negative (Reverse flow) OR very low (Surplus gen)
+    if net_load_kw < EXCESS_SOLAR_THRESHOLD: 
+        if soc < 95.0:
+            # Charge harder if we have reverse flow (negative load)
+            target_charge = 1500.0 if net_load_kw > 0 else 3000.0
+            p_cmd = -min(target_charge, BESS_MAX_POWER)
+            status = "CHARGING (Solar Soak)"
+        else:
+            status = "IDLE (Fully Charged)"
+            
+    # 2. Discharging Logic (Peak Shaving)
+    elif net_load_kw > PEAK_THRESHOLD: 
+        if soc > 20.0:
+            # Only discharge what is needed to bring load down to threshold
+            needed = net_load_kw - PEAK_THRESHOLD
+            p_cmd = min(needed, BESS_MAX_POWER)
+            status = f"DISCHARGING (Shaving {p_cmd:.0f}kW)"
+        else:
+            status = "IDLE (Low Battery)"
+            
+    return p_cmd, status
+
 def get_node_sim_data(bus_name, current_idx):
     try:
         p_kw = df_fa_p[bus_name].iloc[current_idx]
@@ -1100,8 +1239,8 @@ def get_node_sim_data(bus_name, current_idx):
         p_kw = base_load + (10 * np.sin(current_idx * 0.1)) + np.random.uniform(-2, 2)
         q_kvar = p_kw * 0.3
 
-    # PV Injection
-    pv_out, _, _ = calculate_pv_physics(bus_name, current_idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct)
+    # PV Injection (Pass Global Curtailment)
+    pv_out, _, _ = calculate_pv_physics(bus_name, current_idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct, st.session_state.mpc_curtailment)
 
     # Use Physics Engine for Voltage (Reverse Power Flow Aware)
     v_pu = calculate_voltage_profile(bus_name, p_kw, q_kvar, st.session_state.tap_position, p_gen_kw=pv_out)
@@ -1116,63 +1255,80 @@ def get_node_sim_data(bus_name, current_idx):
 # ----------------------------------------------------------
 # MPC CONTROLLER (HEURISTIC SOLVER)
 # ----------------------------------------------------------
-def run_mpc_optimization(current_idx, current_load, current_tap, horizon=6):
+def run_mpc_optimization(current_idx, current_load, current_tap, current_soc, horizon=6):
     """
-    Receding Horizon Control to optimize tap position
-    Cost J = (V_target - V_pred)^2 + Penalty(Tap_Change)
+    Receding Horizon Control with STRICT Voltage Enforcement.
     """
     best_tap = current_tap
+    best_bess_cmd = 0.0
+    best_curtail = 0.0
     min_cost = float('inf')
     
-    # Heuristic Search Space (Limit moves to +/- 1 step or hold)
-    possible_moves = [-0.01, 0.0, 0.01] 
+    tap_moves = [-0.01, 0.0, 0.01]
+    bess_moves = [-BESS_MAX_POWER, -BESS_MAX_POWER * 0.5, 0.0, BESS_MAX_POWER * 0.5, BESS_MAX_POWER]
+    curtail_options = [0.0, 0.5, 1.0] 
     
-    # Future Load & Solar Estimation (Simple Lookahead)
+    if current_tap > 1.05: tap_moves = [-0.01, 0.0]
+    if current_tap < 0.95: tap_moves = [0.0, 0.01]
+
     future_loads = []
-    for h in range(horizon):
-        try:
-            future_loads.append(df_raw["Total_Active_Power"].iloc[(current_idx + h) % len(df_raw)])
-        except:
-            future_loads.append(5000.0)
-            
-    # Solar forecast (Simple lookahead from profile)
     future_solar = []
     for h in range(horizon):
+        try:
+            val = df_raw["Total_Active_Power"].iloc[(current_idx + h) % len(df_raw)]
+            future_loads.append(val)
+        except:
+            future_loads.append(5000.0)
         future_solar.append(get_solar_contribution(current_idx + h))
 
-    # Evaluate each move
-    for move in possible_moves:
-        test_tap = current_tap + move
-        if not (0.90 <= test_tap <= 1.10): continue # Bounds check
-        
-        cost = 0.0
-        # Receding Horizon Simulation
-        for h in range(horizon):
-            # Estimate Net Load
-            # Assume 50% penetration for MPC calc context
-            total_gen_est = future_solar[h] * (len(POTENTIAL_SOLAR_SITES) * 0.5 * 20.0) 
-            net_load_est = future_loads[h] - total_gen_est
+    # Calculate actual dynamic solar capacity
+    active_count = int(len(POTENTIAL_SOLAR_SITES) * st.session_state.spatial_penetration_pct / 100.0)
+    total_capacity = sum([SOLAR_SITE_CAPACITY[b] for b in POTENTIAL_SOLAR_SITES[:active_count]]) if active_count > 0 else 0.0
+
+    for t_move in tap_moves:
+        for b_move in bess_moves:
+            for c_opt in curtail_options:
+                
+                test_tap = current_tap + t_move
+                if not (0.90 <= test_tap <= 1.10): continue 
+                
+                test_soc = current_soc
+                cost = 0.0
+                valid_trajectory = True
+                
+                for h in range(horizon):
+                    test_soc -= (b_move * 1.0 / BESS_CAPACITY_KWH) * 100 
+                    if test_soc < 10.0 or test_soc > 90.0: cost += 50000.0 
+                    
+                    raw_solar = future_solar[h] * total_capacity 
+                    active_solar = raw_solar * (1.0 - c_opt)
+                    if st.session_state.cloud_shading: active_solar *= 0.3
+                    
+                    net_load_est = future_loads[h] - active_solar - b_move
+                    
+                    # ALIGNED PHYSICS: Using the exact same constant as the dashboard
+                    v_drop_est = net_load_est / VOLTAGE_SENSITIVITY_CONST
+                    v_pred = test_tap - v_drop_est
+                    
+                    cost += 10000 * (1.0 - v_pred)**2
+                    if 0.99 <= v_pred <= 1.01: cost -= 50.0
+                    
+                    if t_move != 0: cost += 500.0 
+                    if b_move != 0: cost += 50.0  
+                    if c_opt > 0: cost += (c_opt * 2000.0) 
+                    
+                    # STRICTER PENALTY: Ensure we don't cross 0.95 or 1.05
+                    if v_pred > 1.045 or v_pred < 0.955: 
+                        cost += 1e6 
+                        valid_trajectory = False
+                
+                if valid_trajectory and cost < min_cost:
+                    min_cost = cost
+                    best_tap = test_tap
+                    best_bess_cmd = b_move
+                    best_curtail = c_opt
             
-            # Predict Voltage ( Simplified V ~ Tap - Drop)
-            # Drop proportional to load
-            v_drop_est = net_load_est / 150000.0
-            v_pred = test_tap - v_drop_est
-            
-            # Cost Function
-            # 1. Voltage Deviation from 1.0
-            cost += 1000 * (1.0 - v_pred)**2
-            
-            # 2. Penalty for Step Change (Control Effort)
-            if move != 0: cost += 5.0
-            
-            # 3. Soft Constraint Violation
-            if v_pred > 1.05 or v_pred < 0.95: cost += 5000.0
-            
-        if cost < min_cost:
-            min_cost = cost
-            best_tap = test_tap
-            
-    return best_tap
+    return best_tap, best_bess_cmd, best_curtail
 
 # --- CYBERPUNK PLOTTING FUNCTIONS ---
 def make_cyber_meter(value, delta_val, title, min_val, max_val, color_hex):
@@ -1328,6 +1484,7 @@ with st.sidebar:
     with c1: st.write("")
     with c2: st.markdown("### AZU Digital Twin\n*Final Year Project - II*")
     
+   
     curr_v = 0.0 if st.session_state.relay_trip else ((0.85 * st.session_state.tap_position) if st.session_state.fault_active else (0.99 * st.session_state.tap_position))
     curr_state, state_col, state_desc = get_operating_state(curr_v, 1.0, st.session_state.fault_active, st.session_state.relay_trip)
     
@@ -1360,6 +1517,12 @@ with st.sidebar:
         if mpc_mode != st.session_state.mpc_active:
              log_event("Control", "Mode Change", "MPC Agent Active" if mpc_mode else "Manual/Rule Control")
         st.session_state.mpc_active = mpc_mode
+        
+        # --- BESS TOGGLE ---
+        bess_on = st.toggle("🔋 ACTIVATE BESS BUFFER", value=st.session_state.bess_active, help="Grid-Scale Battery: Absorbs excess solar and shaves peak load.")
+        if bess_on != st.session_state.bess_active:
+             log_event("Control", "Mode Change", "BESS Buffer Active" if bess_on else "BESS Offline")
+        st.session_state.bess_active = bess_on
         
         if st.button("RESTART", use_container_width=True):
             st.session_state.idx = 0
@@ -1485,7 +1648,8 @@ def render_hvac():
 
 @st.fragment(run_every=speed if st.session_state.run_simulation else None)
 def render_home():
-    if st.session_state.run_simulation: st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
+    # CALL THE MASTER TICK
+    advance_simulation_step()    
     idx = st.session_state.idx
     row = df_raw.iloc[idx]
     
@@ -1499,28 +1663,23 @@ def render_home():
     # Total Solar Generation (Dynamic based on Penetration)
     total_pv_gen = 0.0
     for bus_name in POTENTIAL_SOLAR_SITES:
-        p_val, _, _ = calculate_pv_physics(bus_name, idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct)
+        # UPDATED LINE HERE:
+        p_val, _, _ = calculate_pv_physics(bus_name, idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct, st.session_state.mpc_curtailment)
         total_pv_gen += p_val
         
-    # BESS Dispatch - DISABLED
+    # BESS Dispatch
     p_bess, bess_mode = bess_dispatch_logic(p_load_total - total_pv_gen, idx)
     
     # Net Grid Load
     p_grid_net = p_load_total - total_pv_gen - p_bess
-    
     q_val = row["Total_Reac_Power"] + (st.session_state.hvac_load_kw * 0.6)
-    
-    recloser_logic()
-    freq, temp = update_grid_physics(p_grid_net, q_val)
     
     delta_p = p_grid_net - st.session_state.prev_p
     delta_q = q_val - st.session_state.prev_q
-    st.session_state.prev_p = p_grid_net
-    st.session_state.prev_q = q_val
 
     current_voltage_pu = 0.0 if st.session_state.relay_trip else ((0.85 * st.session_state.tap_position) if st.session_state.fault_active else (0.99 * st.session_state.tap_position))
     sys_state, sys_color, sys_desc = get_operating_state(current_voltage_pu, 1.0, st.session_state.fault_active, st.session_state.relay_trip)
-    disp_freq = apply_scada_noise(freq, 0.02)
+    disp_freq = apply_scada_noise(st.session_state.grid_freq, 0.02)
     
     # REVERSE POWER ALERT
     if p_grid_net < -50.0: # Significant backfeed
@@ -1538,8 +1697,8 @@ def render_home():
     
     # --- METRICS ROW ---
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-    col_s1.metric("TOTAL SOLAR PV", f"{total_pv_gen:.1f} kW", delta="Cloud Effect" if st.session_state.cloud_shading else "Optimal")
-    col_s2.metric("BESS STATUS", "OFFLINE", delta="Disabled")
+    col_s1.metric("TOTAL SOLAR PV", f"{total_pv_gen:.1f} kW", delta=f"Curtailment: {int(st.session_state.mpc_curtailment*100)}%")
+    col_s2.metric("BESS STATUS", bess_mode, delta=f"SOC: {st.session_state.bess_soc:.1f}%")
     col_s3.metric("GRID NET LOAD", f"{p_grid_net:.1f} kW")
     # Penetration Metric
     penetration_display_pct = st.session_state.spatial_penetration_pct
@@ -1593,23 +1752,14 @@ def render_home():
     g_denom = np.sqrt(g_p_total**2 + g_q_total**2)
     g_pf = g_p_total / g_denom if g_denom > 0 else 1.0
     
-    # Global Avg Voltage (Heuristic based on Source Tap - System Load Droop)
-    # Simulating the average voltage across the distribution network
-    # LINKED TO NET LOAD (Includes Solar) to show Reverse Flow Voltage Rise
-    voltage_sensitivity = 150000.0 # Sensitivity factor
-    g_avg_voltage = st.session_state.tap_position - (p_grid_net / voltage_sensitivity)
-    g_avg_voltage = apply_scada_noise(g_avg_voltage, 0.002)
+    # Get the latest average voltage from the global array calculated in the master tick
+    g_avg_voltage = st.session_state.global_v_history[-1] if len(st.session_state.global_v_history) > 0 else 1.0
     
     # Global SE (Aggregation of residuals)
     # If attack is active, global residual spikes
     g_se_resid = 0.02 + np.random.uniform(0, 0.01)
     if st.session_state.fdi_attack: g_se_resid += 0.15
     if st.session_state.fault_active: g_se_resid += 0.08
-    
-    # Update Histories
-    st.session_state.global_v_history.append(g_avg_voltage)
-    st.session_state.global_pf_history.append(g_pf)
-    st.session_state.global_j_history.append(g_se_resid)
     
     # --- VOLTAGE LIMIT CHECK LOGIC ---
     v_status_label = "NOMINAL RANGE"
@@ -1655,7 +1805,8 @@ def render_home():
 
 @st.fragment(run_every=speed if st.session_state.run_simulation else None)
 def render_feeder(view_bus):
-    if st.session_state.run_simulation: st.session_state.idx = (st.session_state.idx + 1) % len(df_fa_p)
+    # CALL THE MASTER TICK
+    advance_simulation_step()
     idx = st.session_state.idx
     
     try:
@@ -1704,21 +1855,14 @@ def render_feeder(view_bus):
     # --- UPDATED: MPC AGENT INTEGRATION ---
     avr_status = "IDLE"
     
-    # If MPC is ACTIVE, it overrides the Auto-Tap logic
     if st.session_state.mpc_active and not st.session_state.relay_trip:
-        # Run the MPC Solver
-        optimized_tap = run_mpc_optimization(idx, display_p, st.session_state.tap_position)
-        
-        # Apply the optimized tap
-        if optimized_tap != st.session_state.tap_position:
-            st.session_state.tap_position = optimized_tap
-            st.session_state.tap_moves_count += 1
-            avr_status = "🤖 MPC OPTIMIZING..."
-            # Re-Calculate Voltage IMMEDIATELY
-            voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
+        avr_status = "🤖 MPC OPTIMIZING..."
+        # Simply calculate the local visual results based on global commands
+        pv_output_new, _, _ = calculate_pv_physics(view_bus, idx, st.session_state.room_temp, st.session_state.spatial_penetration_pct, st.session_state.mpc_curtailment)
+        voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=pv_output_new, q_gen_kvar=smart_q)
             
     elif st.session_state.auto_tap_mode and not st.session_state.relay_trip:
-        # Standard Rule-Based Logic
+        # Standard Rule-Based Logic (Only runs if AI is off)
         did_tap_change = False
         step_change = 0.005 # 0.5% Step
         
@@ -1736,8 +1880,6 @@ def render_feeder(view_bus):
         if did_tap_change:
             st.session_state.tap_moves_count += 1
             voltage_pu_phys = calculate_voltage_profile(view_bus, display_p, display_q, st.session_state.tap_position, p_gen_kw=smart_p, q_gen_kvar=smart_q)
-            if st.session_state.tap_moves_count % 10 == 0:
-                 log_event("Equipment", "Stress", f"High Tap Frequency: {st.session_state.tap_moves_count} ops")
     # ----------------------------------------------------
 
     # --- TECHNICAL IMPACTS ANALYSIS ---
@@ -2066,102 +2208,156 @@ def render_feeder(view_bus):
     with c_phasor:
         st.plotly_chart(draw_phasor(Ia, Id, Ib, Ibd, Ic, Icd), use_container_width=True, key="phasor_diagram")
 
+
 @st.fragment(run_every=speed if st.session_state.run_simulation else None)
 def render_topology():
-    if st.session_state.run_simulation: 
-        st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
+    st.header("🗺️ GEOSPATIAL GRID TOPOLOGY")
+    advance_simulation_step()
     
-    st.markdown("### 🌐 DIGITAL TWIN TOPOLOGY (SLD)")
-    col_map, col_details = st.columns([3, 1])
-    selected_node = st.selectbox("🎯 SELECT ASSET (Or click on map nodes below)", ["All"] + bus_list, index=0)
+    idx = st.session_state.idx
     
-    edge_traces = []
-    x_norm, y_norm = [], []
-    x_heavy, y_heavy = [], []
-    x_crit, y_crit = [], []
+    # --- PREPARE GRAPH DATA ---
+    edge_x = []
+    edge_y = []
     
-    for i, (b1, b2) in enumerate(EDGE_LIST_RAW):
-        if b1 in bus_dict and b2 in bus_dict:
-            x0, y0 = bus_dict[b1]
-            x1, y1 = bus_dict[b2]
-            load_factor = ((i + st.session_state.idx) % 50) / 50.0 
-            if load_factor > 0.9:
-                x_crit.extend([x0, x1, None]); y_crit.extend([y0, y1, None])
-            elif load_factor > 0.7:
-                x_heavy.extend([x0, x1, None]); y_heavy.extend([y0, y1, None])
-            else:
-                x_norm.extend([x0, x1, None]); y_norm.extend([y0, y1, None])
-
-    edge_traces.append(go.Scatter(x=x_norm, y=y_norm, line=dict(width=1, color='#00f3ff'), hoverinfo='none', mode='lines', name='Normal Load'))
-    edge_traces.append(go.Scatter(x=x_heavy, y=y_heavy, line=dict(width=2, color='#ffae00'), hoverinfo='none', mode='lines', name='Heavy Load'))
-    edge_traces.append(go.Scatter(x=x_crit, y=y_crit, line=dict(width=2, color='#ff0055', dash='dot'), hoverinfo='none', mode='lines', name='Critical'))
-
-    node_x, node_y, node_color, node_size, node_sym, node_text = [], [], [], [], [], []
-    
-    # Calculate active solar count for topology visualization
-    active_count = int(len(POTENTIAL_SOLAR_SITES) * st.session_state.spatial_penetration_pct / 100.0)
-    active_solar_list = POTENTIAL_SOLAR_SITES[:active_count]
-
-    for bus, (bx, by) in bus_dict.items():
-        node_x.append(bx); node_y.append(by)
-        
-        # --- DYNAMIC NODE STYLING LOGIC ---
-        if bus in active_solar_list:
-            n_type, col, size, sym = "ACTIVE SOLAR", "#ffff00", 14, "circle-x" # Yellow for Solar
-        elif bus in TRANSFORMER_NODES: 
-            n_type, col, size, sym = "TRANSFORMER", "#ffae00", 12, "star"
-        elif "source" in bus or bus == "bus1": 
-            n_type, col, size, sym = "SUBSTATION", "#ffffff", 18, "diamond"
-        else: 
-            n_type, col, size, sym = "LOAD BUS", "#00f3ff", 6, "circle"
+    # Build Line Segments
+    for edge in EDGE_LIST_RAW:
+        u, v = edge
+        if u in bus_dict and v in bus_dict:
+            x0, y0 = bus_dict[u]
+            x1, y1 = bus_dict[v]
+            edge_x.append(x0)
+            edge_x.append(x1)
+            edge_x.append(None) # Break line
+            edge_y.append(y0)
+            edge_y.append(y1)
+            edge_y.append(None) # Break line
             
-        if selected_node != "All":
-            if bus == selected_node: col, size = "#ff00ff", 22
-            else: col = "rgba(0, 243, 255, 0.3)"
+    node_x = []
+    node_y = []
+    node_color = []
+    node_size = []
+    node_text = []
+    node_symbol = []
+    
+    # Iterate buses for Physics & Visualization
+    for bus, (x, y) in bus_dict.items():
+        # Retrieve physics data using existing helper
+        v_pu, i_amps, p_kw, q_kvar, pf, pv_out = get_node_sim_data(bus, idx)
         
-        node_color.append(col); node_size.append(size); node_sym.append(sym)
-        node_text.append(f"<b>{bus.upper()}</b><br>{n_type}")
+        # Default Style
+        col = "#00f3ff" # Nominal Cyan
+        sz = 8
+        sym = "circle"
+        status_txt = "NORMAL"
+        
+        # 1. Fault & Protection Logic
+        if st.session_state.relay_trip:
+            col = "#333333" # Blackout/Dead
+            status_txt = "BLACKOUT"
+        elif st.session_state.fault_active and bus == st.session_state.fault_bus:
+            col = "#ff0000" # Red Flash
+            sz = 20
+            sym = "x"
+            status_txt = "FAULT LOCATION"
+        # 2. Voltage Violation Logic
+        elif v_pu < 0.95:
+            col = "#ffae00" # Low Voltage (Orange)
+            sz = 12
+            status_txt = "UNDER VOLTAGE"
+        elif v_pu > 1.05:
+            col = "#ff00ff" # High Voltage (Magenta)
+            sz = 12
+            status_txt = "OVER VOLTAGE"
+        
+        # 3. Component Highlighting
+        if bus in TRANSFORMER_NODES:
+            sym = "square"
+            sz = 12 if sz < 12 else sz
+            
+        if pv_out > 0.1:
+            if col == "#00f3ff": col = "#ffff00" # Solar Active (Yellow) if not faulted
+            sym = "diamond"
+            sz = 10
+            status_txt += " (PV ACTIVE)"
+            
+        node_x.append(x)
+        node_y.append(y)
+        node_color.append(col)
+        node_size.append(sz)
+        node_symbol.append(sym)
+        
+        hover = (f"<b>{bus.upper()}</b><br>"
+                 f"State: {status_txt}<br>"
+                 f"Voltage: {v_pu:.3f} pu<br>"
+                 f"Load: {p_kw:.1f} kW<br>"
+                 f"Solar: {pv_out:.1f} kW")
+        node_text.append(hover)
 
-    node_trace = go.Scatter(x=node_x, y=node_y, mode='markers', text=node_text, hoverinfo='text', marker=dict(symbol=node_sym, color=node_color, size=node_size, line=dict(width=1, color='#000')), name="Assets")
-
-    with col_map:
-        fig = go.Figure(data=edge_traces + [node_trace])
-        fig.update_layout(showlegend=True, legend=dict(x=0, y=1, bgcolor='rgba(0,0,0,0.5)', font=dict(color='white')), hovermode='closest', margin=dict(b=0,l=0,r=0,t=0), xaxis=dict(showgrid=False, zeroline=False, showticklabels=False), yaxis=dict(showgrid=False, zeroline=False, showticklabels=False), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=650, dragmode='pan')
+    # --- PLOTLY DRAW ---
+    fig = go.Figure()
+    
+    # 1. Edges (Grid Lines)
+    fig.add_trace(go.Scatter(
+        x=edge_x, y=edge_y,
+        line=dict(width=1, color='#444'),
+        hoverinfo='none',
+        mode='lines',
+        name='Distribution Lines'
+    ))
+    
+    # 2. Nodes (Buses)
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers',
+        marker=dict(
+            symbol=node_symbol,
+            size=node_size,
+            color=node_color,
+            line=dict(width=1, color='white'),
+            opacity=0.9
+        ),
+        text=node_text,
+        hoverinfo='text',
+        name='Nodes'
+    ))
+    
+    fig.update_layout(
+        title="DIGITAL TWIN SPATIAL VIEW",
+        title_font=dict(family="Orbitron", size=18, color="#00f3ff"),
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(b=10,l=10,r=10,t=40),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, scaleanchor="x", scaleratio=1),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        height=650,
+        dragmode='pan'
+    )
+    
+    col_main, col_legend = st.columns([4, 1])
+    
+    with col_main:
         st.plotly_chart(fig, use_container_width=True)
-
-    with col_details:
-        if selected_node != "All":
-            v, i, p, q, pf, pv_out = get_node_sim_data(selected_node, st.session_state.idx)
-            st.markdown(f"""
-            <div style="background: rgba(20,20,30,0.9); border: 1px solid #00f3ff; padding: 15px; border-radius: 5px;">
-                <h4 style="margin:0; color: #ff00ff;">INSPECTOR</h4>
-                <h2 style="margin:0; color: white;">{selected_node.upper()}</h2>
-                <hr style="border-color: #333;">
-            </div>
-            """, unsafe_allow_html=True)
-            c_d1, c_d2 = st.columns(2)
-            c_d1.metric("VOLTAGE", f"{v:.3f} pu", delta="-1.2%" if v < 0.98 else "OK")
-            c_d2.metric("CURRENT", f"{i:.1f} A")
-            
-            if pv_out > 0:
-                 st.metric("SOLAR GENERATION", f"{pv_out:.1f} kW", delta="Active", delta_color="normal")
-            
-            st.metric("POWER FACTOR", f"{pf:.2f}")
-            fig_mini_phasor = go.Figure()
-            fig_mini_phasor.add_trace(go.Scatterpolar(r=[0, v], theta=[0, 0], mode='lines+markers', line=dict(color='#00f3ff', width=3), name='V'))
-            fig_mini_phasor.add_trace(go.Scatterpolar(r=[0, i/100], theta=[0, -30], mode='lines+markers', line=dict(color='#ffae00', width=3), name='I'))
-            fig_mini_phasor.update_layout(polar=dict(radialaxis=dict(visible=False), angularaxis=dict(visible=False), bgcolor="rgba(0,0,0,0)"), paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=10, r=10, t=20, b=20), height=150, showlegend=False, title=dict(text="LOCAL PHASOR", font=dict(size=10, color="#ccc")))
-            st.plotly_chart(fig_mini_phasor, use_container_width=True)
-            load_pct = min(100, (p/100)*100)
-            st.write(f"**LOAD CAPACITY: {load_pct:.1f}%**")
-            st.progress(int(load_pct)/100)
-        else:
-            st.info("👈 Select a node on the map to view real-time telemetry.")
+        
+    with col_legend:
+        st.markdown("#### LEGEND")
+        st.markdown("🟦 **NORMAL**")
+        st.markdown("🟨 **SOLAR**")
+        st.markdown("🟧 **LOW V**")
+        st.markdown("🟪 **HIGH V**")
+        st.markdown("🟥 **FAULT**")
+        st.markdown("◼️ **XFMR**")
+        
+        st.markdown("---")
+        st.metric("Total Nodes", len(bus_dict))
+        st.metric("Total Lines", len(EDGE_LIST_RAW))
 
 @st.fragment(run_every=speed if st.session_state.run_simulation else None)
 def render_ai_dashboard():
-    if st.session_state.run_simulation: 
-        st.session_state.idx = (st.session_state.idx + 1) % len(df_raw)
+    advance_simulation_step()
+    idx = st.session_state.idx
         
     if not PROPHET_AVAILABLE or not LSTM_AVAILABLE:
         st.error(f"⚠️ MISSING LIBS: Prophet={PROPHET_AVAILABLE}, LSTM={LSTM_AVAILABLE}")
